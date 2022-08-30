@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	kmmv1beta1 "github.com/rh-ecosystem-edge/kernel-module-management/api/v1beta1"
+	"github.com/qbarrand/oot-operator/internal/jobmanager"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/build"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
@@ -15,20 +16,53 @@ import (
 
 //go:generate mockgen -source=maker.go -package=job -destination=mock_maker.go
 
-type Maker interface {
-	MakeJob(mod kmmv1beta1.Module, buildConfig *kmmv1beta1.Build, targetKernel, containerImage string) (*batchv1.Job, error)
-}
-
-type maker struct {
+type builder struct {
+	name string
 	helper build.Helper
 	scheme *runtime.Scheme
 }
 
-func NewMaker(helper build.Helper, scheme *runtime.Scheme) Maker {
-	return &maker{helper: helper, scheme: scheme}
+func NewBuilder(helper build.Helper, scheme *runtime.Scheme) Job {
+	return &builder{name: "Build", helper: helper, scheme: scheme}
 }
 
-func (m *maker) MakeJob(mod kmmv1beta1.Module, buildConfig *kmmv1beta1.Build, targetKernel, containerImage string) (*batchv1.Job, error) {
+func (m *builder) GetName() string {
+	return m.name
+}
+
+func (m *builder) ShouldRun(mod *ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) bool{
+	if mod.Spec.Build == nil && km.Build == nil {
+		return false
+	}
+	return true
+}
+
+
+func (m *builder) PullOptions(km ootov1alpha1.KernelMapping) ootov1alpha1.PullOptions{
+	return km.Build.Pull
+}
+
+func (m *builder) GetOutputImage(mod ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) (string,error) {
+        switch {
+        case km.Sign.UnsignedImage != "":
+                return km.Sign.UnsignedImage, nil
+        case km.ContainerImage != "":
+                return km.ContainerImage, nil
+        default:
+                return "",fmt.Errorf("Failed to find container image name")
+        }
+}
+
+
+func (m *builder) MakeJob(mod kmmv1beta1.Module, km *kmmv1beta1.KernelMapping, targetKernel string) (*batchv1.Job, error) {
+
+        buildConfig := m.helper.GetRelevantBuild(mod, *km)
+
+        containerImage, err := m.GetOutputImage(mod,km)
+        if err != nil {
+                return nil, err
+        }
+
 	args := []string{"--destination", containerImage}
 
 	buildArgs := m.helper.ApplyBuildArgOverrides(
@@ -80,18 +114,18 @@ func (m *maker) MakeJob(mod kmmv1beta1.Module, buildConfig *kmmv1beta1.Build, ta
 
 	volumes := []v1.Volume{dockerFileVolume}
 	volumeMounts := []v1.VolumeMount{dockerFileVolumeMount}
-	if irs := mod.Spec.ImageRepoSecret; irs != nil {
-		volumes = append(volumes, makeImagePullSecretVolume(irs))
-		volumeMounts = append(volumeMounts, makeImagePullSecretVolumeMount(irs))
+	if mod.Spec.ImagePullSecret != nil {
+		volumes = append(volumes, m.makeImagePullSecretVolume(mod.Spec.ImagePullSecret))
+		volumeMounts = append(volumeMounts, m.makeImagePullSecretVolumeMount(mod.Spec.ImagePullSecret))
 	}
-	volumes = append(volumes, makeBuildSecretVolumes(buildConfig.Secrets)...)
-	volumeMounts = append(volumeMounts, makeBuildSecretVolumeMounts(buildConfig.Secrets)...)
+	volumes = append(volumes, m.makeBuildSecretVolumes(buildConfig.Secrets)...)
+	volumeMounts = append(volumeMounts, m.makeBuildSecretVolumeMounts(buildConfig.Secrets)...)
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: mod.Name + "-build-",
 			Namespace:    mod.Namespace,
-			Labels:       labels(mod, targetKernel),
+			Labels:       labels(mod, targetKernel, m.GetName()),
 		},
 		Spec: batchv1.JobSpec{
 			Completions: pointer.Int32(1),
@@ -106,6 +140,7 @@ func (m *maker) MakeJob(mod kmmv1beta1.Module, buildConfig *kmmv1beta1.Build, ta
 							Name:         "kaniko",
 							Image:        "gcr.io/kaniko-project/executor:latest",
 							VolumeMounts: volumeMounts,
+							SecurityContext: mod.Spec.DriverContainer.SecurityContext,
 						},
 					},
 					NodeSelector:  mod.Spec.Selector,
@@ -123,14 +158,14 @@ func (m *maker) MakeJob(mod kmmv1beta1.Module, buildConfig *kmmv1beta1.Build, ta
 	return job, nil
 }
 
-func makeImagePullSecretVolume(secretRef *v1.LocalObjectReference) v1.Volume {
+func (m *builder) makeImagePullSecretVolume(secretRef *v1.LocalObjectReference) v1.Volume {
 
 	if secretRef == nil {
 		return v1.Volume{}
 	}
 
 	return v1.Volume{
-		Name: volumeNameFromSecretRef(*secretRef),
+		Name: m.volumeNameFromSecretRef(*secretRef),
 		VolumeSource: v1.VolumeSource{
 			Secret: &v1.SecretVolumeSource{
 				SecretName: secretRef.Name,
@@ -145,26 +180,26 @@ func makeImagePullSecretVolume(secretRef *v1.LocalObjectReference) v1.Volume {
 	}
 }
 
-func makeImagePullSecretVolumeMount(secretRef *v1.LocalObjectReference) v1.VolumeMount {
+func (m *builder) makeImagePullSecretVolumeMount(secretRef *v1.LocalObjectReference) v1.VolumeMount {
 
 	if secretRef == nil {
 		return v1.VolumeMount{}
 	}
 
 	return v1.VolumeMount{
-		Name:      volumeNameFromSecretRef(*secretRef),
+		Name:      m.volumeNameFromSecretRef(*secretRef),
 		ReadOnly:  true,
 		MountPath: "/kaniko/.docker",
 	}
 }
 
-func makeBuildSecretVolumes(secretRefs []v1.LocalObjectReference) []v1.Volume {
+func (m *builder) makeBuildSecretVolumes(secretRefs []v1.LocalObjectReference) []v1.Volume {
 
 	volumes := make([]v1.Volume, 0, len(secretRefs))
 
 	for _, secretRef := range secretRefs {
 		vol := v1.Volume{
-			Name: volumeNameFromSecretRef(secretRef),
+			Name: m.volumeNameFromSecretRef(secretRef),
 			VolumeSource: v1.VolumeSource{
 				Secret: &v1.SecretVolumeSource{
 					SecretName: secretRef.Name,
@@ -178,13 +213,13 @@ func makeBuildSecretVolumes(secretRefs []v1.LocalObjectReference) []v1.Volume {
 	return volumes
 }
 
-func makeBuildSecretVolumeMounts(secretRefs []v1.LocalObjectReference) []v1.VolumeMount {
+func (m *builder) makeBuildSecretVolumeMounts(secretRefs []v1.LocalObjectReference) []v1.VolumeMount {
 
 	secretVolumeMounts := make([]v1.VolumeMount, 0, len(secretRefs))
 
 	for _, secretRef := range secretRefs {
 		volMount := v1.VolumeMount{
-			Name:      volumeNameFromSecretRef(secretRef),
+			Name:      m.volumeNameFromSecretRef(secretRef),
 			ReadOnly:  true,
 			MountPath: "/run/secrets/" + secretRef.Name,
 		}
@@ -195,6 +230,6 @@ func makeBuildSecretVolumeMounts(secretRefs []v1.LocalObjectReference) []v1.Volu
 	return secretVolumeMounts
 }
 
-func volumeNameFromSecretRef(ref v1.LocalObjectReference) string {
+func (m *builder) volumeNameFromSecretRef(ref v1.LocalObjectReference) string {
 	return "secret-" + ref.Name
 }
