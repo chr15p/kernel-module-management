@@ -46,7 +46,7 @@ func (jbm *jobManager) GetName() string {
 	return jbm.maker.GetName()
 }
 
-func (jbm *jobManager) ShouldRun(mod *ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) bool{
+func (jbm *jobManager) ShouldRun(mod *kmmv1beta1.Module, km *kmmv1beta1.KernelMapping) bool{
 	return jbm.maker.ShouldRun(mod, km)
 }
 

@@ -23,8 +23,8 @@ import (
 	"os"
 	"runtime/debug"
 
-	"github.com/rh-ecosystem-edge/kernel-module-management/internal/build"
-	"github.com/rh-ecosystem-edge/kernel-module-management/internal/build/job"
+	"github.com/rh-ecosystem-edge/kernel-module-management/internal/jobmanager"
+	"github.com/rh-ecosystem-edge/kernel-module-management/internal/jobmanager/job"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/daemonset"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/filter"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/metrics"

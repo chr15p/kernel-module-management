@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	ootov1alpha1 "github.com/qbarrand/oot-operator/api/v1alpha1"
-	"github.com/qbarrand/oot-operator/internal/jobmanager"
+	kmmv1beta1 "github.com/rh-ecosystem-edge/kernel-module-management/api/v1beta1"
+	"github.com/rh-ecosystem-edge/kernel-module-management/internal/jobmanager"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,18 +30,18 @@ func (m *signer) GetName() string {
 	return m.name
 }
 
-func (m *signer) ShouldRun(mod *ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) bool{
+func (m *signer) ShouldRun(mod *kmmv1beta1.Module, km *kmmv1beta1.KernelMapping) bool{
 	if km.Sign == nil {
 		return false
 	}
 	return true
 }
 
-func (m *signer) PullOptions(km ootov1alpha1.KernelMapping) ootov1alpha1.PullOptions{
+func (m *signer) PullOptions(km kmmv1beta1.KernelMapping) kmmv1beta1.PullOptions{
 	return km.Sign.Pull
 }
 
-func (m *signer) GetOutputImage(mod ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) (string,error) {
+func (m *signer) GetOutputImage(mod kmmv1beta1.Module, km *kmmv1beta1.KernelMapping) (string,error) {
         switch {
         case km.Sign.SignedImage != "":
                 return km.Sign.SignedImage, nil
@@ -53,7 +53,7 @@ func (m *signer) GetOutputImage(mod ootov1alpha1.Module, km *ootov1alpha1.Kernel
 }
 
 
-func (m *signer) MakeJob(mod ootov1alpha1.Module,  km *ootov1alpha1.KernelMapping, targetKernel string) (*batchv1.Job, error) {
+func (m *signer) MakeJob(mod kmmv1beta1.Module,  km *kmmv1beta1.KernelMapping, targetKernel string) (*batchv1.Job, error) {
 	var args []string
 
 	signConfig := km.Sign

@@ -2,15 +2,15 @@ package job
 
 
 import (
-	ootov1alpha1 "github.com/qbarrand/oot-operator/api/v1alpha1"
+	kmmv1beta1 "github.com/rh-ecosystem-edge/kernel-module-management/api/v1beta1"
 	batchv1 "k8s.io/api/batch/v1"
 )
 
 
 type Job interface {
-	MakeJob(mod ootov1alpha1.Module, m *ootov1alpha1.KernelMapping, targetKernel string) (*batchv1.Job, error)
-	PullOptions(km ootov1alpha1.KernelMapping) ootov1alpha1.PullOptions
-	ShouldRun(mod *ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) bool
+	MakeJob(mod kmmv1beta1.Module, m *kmmv1beta1.KernelMapping, targetKernel string) (*batchv1.Job, error)
+	PullOptions(km kmmv1beta1.KernelMapping) kmmv1beta1.PullOptions
+	ShouldRun(mod *kmmv1beta1.Module, km *kmmv1beta1.KernelMapping) bool
 	GetName() string
-	GetOutputImage(mod ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) (string,error)
+	GetOutputImage(mod kmmv1beta1.Module, km *kmmv1beta1.KernelMapping) (string,error)
 }

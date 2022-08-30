@@ -4,8 +4,7 @@ import (
 	"fmt"
 
 	kmmv1beta1 "github.com/rh-ecosystem-edge/kernel-module-management/api/v1beta1"
-	"github.com/qbarrand/oot-operator/internal/jobmanager"
-	"github.com/rh-ecosystem-edge/kernel-module-management/internal/build"
+	"github.com/rh-ecosystem-edge/kernel-module-management/internal/jobmanager"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,19 +29,19 @@ func (m *builder) GetName() string {
 	return m.name
 }
 
-func (m *builder) ShouldRun(mod *ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) bool{
-	if mod.Spec.Build == nil && km.Build == nil {
+func (m *builder) ShouldRun(mod *kmmv1beta1.Module, km *kmmv1beta1.KernelMapping) bool{
+	if mod.Spec.ModuleLoader.Container.Build == nil && km.Build == nil {
 		return false
 	}
 	return true
 }
 
 
-func (m *builder) PullOptions(km ootov1alpha1.KernelMapping) ootov1alpha1.PullOptions{
+func (m *builder) PullOptions(km kmmv1beta1.KernelMapping) kmmv1beta1.PullOptions{
 	return km.Build.Pull
 }
 
-func (m *builder) GetOutputImage(mod ootov1alpha1.Module, km *ootov1alpha1.KernelMapping) (string,error) {
+func (m *builder) GetOutputImage(mod kmmv1beta1.Module, km *kmmv1beta1.KernelMapping) (string,error) {
         switch {
         case km.Sign.UnsignedImage != "":
                 return km.Sign.UnsignedImage, nil
@@ -114,9 +113,9 @@ func (m *builder) MakeJob(mod kmmv1beta1.Module, km *kmmv1beta1.KernelMapping, t
 
 	volumes := []v1.Volume{dockerFileVolume}
 	volumeMounts := []v1.VolumeMount{dockerFileVolumeMount}
-	if mod.Spec.ImagePullSecret != nil {
-		volumes = append(volumes, m.makeImagePullSecretVolume(mod.Spec.ImagePullSecret))
-		volumeMounts = append(volumeMounts, m.makeImagePullSecretVolumeMount(mod.Spec.ImagePullSecret))
+	if mod.Spec.ImageRepoSecret != nil {
+		volumes = append(volumes, m.makeImagePullSecretVolume(mod.Spec.ImageRepoSecret))
+		volumeMounts = append(volumeMounts, m.makeImagePullSecretVolumeMount(mod.Spec.ImageRepoSecret))
 	}
 	volumes = append(volumes, m.makeBuildSecretVolumes(buildConfig.Secrets)...)
 	volumeMounts = append(volumeMounts, m.makeBuildSecretVolumeMounts(buildConfig.Secrets)...)
@@ -140,7 +139,6 @@ func (m *builder) MakeJob(mod kmmv1beta1.Module, km *kmmv1beta1.KernelMapping, t
 							Name:         "kaniko",
 							Image:        "gcr.io/kaniko-project/executor:latest",
 							VolumeMounts: volumeMounts,
-							SecurityContext: mod.Spec.DriverContainer.SecurityContext,
 						},
 					},
 					NodeSelector:  mod.Spec.Selector,
