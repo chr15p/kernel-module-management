@@ -241,6 +241,43 @@ spec:
       workspaces:
       - name: source
         workspace: workspace
+    - name: build-signimage
+      params:
+      - name: IMAGE
+        value: $(params.output-image)
+      - name: DOCKERFILE
+        value: Dockerfile.signimage
+      - name: CONTEXT
+        value: $(params.path-context)
+      - name: HERMETIC
+        value: $(params.hermetic)
+      - name: PREFETCH_INPUT
+        value: $(params.prefetch-input)
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.image-expires-after)
+      - name: COMMIT_SHA
+        value: $(tasks.clone-repository.results.commit)
+      - name: TARGET
+        value: docker-build
+      runAfter:
+      - prefetch-dependencies
+      taskRef:
+        params:
+        - name: name
+          value: buildah
+        - name: bundle
+          value: quay.io/redhat-appstudio-tekton-catalog/task-buildah:0.1@sha256:16c429b61abb6c6b3b4d96706f329dc88e2a4fb22b6b4fe804ce32e91b561fd7
+        - name: kind
+          value: task
+        resolver: bundles
+      when:
+      - input: $(tasks.init.results.build)
+        operator: in
+        values:
+        - "true"
+      workspaces:
+      - name: source
+        workspace: workspace
     - name: build-source-image
       params:
       - name: BINARY_IMAGE
@@ -249,6 +286,7 @@ spec:
         value: $(tasks.build-container.results.BASE_IMAGES_DIGESTS)
       runAfter:
       - build-container
+      - build-signimage
       taskRef:
         params:
         - name: name
@@ -276,6 +314,7 @@ spec:
         value: $(tasks.build-container.results.BASE_IMAGES_DIGESTS)
       runAfter:
       - build-container
+      - build-signimage
       taskRef:
         params:
         - name: name
@@ -298,6 +337,7 @@ spec:
         value: $(tasks.build-container.results.IMAGE_URL)
       runAfter:
       - build-container
+      - build-signimage
       taskRef:
         params:
         - name: name
@@ -340,6 +380,7 @@ spec:
         value: $(tasks.build-container.results.IMAGE_URL)
       runAfter:
       - build-container
+      - build-signimage
       taskRef:
         params:
         - name: name
@@ -362,6 +403,7 @@ spec:
         value: $(tasks.build-container.results.IMAGE_DIGEST)
       runAfter:
       - build-container
+      - build-signimage
       taskRef:
         params:
         - name: name
