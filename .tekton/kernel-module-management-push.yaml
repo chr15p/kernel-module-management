@@ -220,6 +220,8 @@ spec:
         value: $(params.image-expires-after)
       - name: COMMIT_SHA
         value: $(tasks.clone-repository.results.commit)
+      - name: TARGET
+        value: docker-build
       runAfter:
       - prefetch-dependencies
       taskRef:
