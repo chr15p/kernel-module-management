@@ -241,12 +241,12 @@ spec:
       workspaces:
       - name: source
         workspace: workspace
-    - name: build-signimage
+    - name: build-worker
       params:
       - name: IMAGE
         value: $(params.output-image)
       - name: DOCKERFILE
-        value: Dockerfile.signimage
+        value: Dockerfile.worker
       - name: CONTEXT
         value: $(params.path-context)
       - name: HERMETIC
@@ -286,7 +286,7 @@ spec:
         value: $(tasks.build-container.results.BASE_IMAGES_DIGESTS)
       runAfter:
       - build-container
-      - build-signimage
+      - build-worker
       taskRef:
         params:
         - name: name
@@ -314,7 +314,7 @@ spec:
         value: $(tasks.build-container.results.BASE_IMAGES_DIGESTS)
       runAfter:
       - build-container
-      - build-signimage
+      - build-worker
       taskRef:
         params:
         - name: name
@@ -337,7 +337,7 @@ spec:
         value: $(tasks.build-container.results.IMAGE_URL)
       runAfter:
       - build-container
-      - build-signimage
+      - build-worker
       taskRef:
         params:
         - name: name
@@ -380,7 +380,7 @@ spec:
         value: $(tasks.build-container.results.IMAGE_URL)
       runAfter:
       - build-container
-      - build-signimage
+      - build-worker
       taskRef:
         params:
         - name: name
@@ -403,7 +403,7 @@ spec:
         value: $(tasks.build-container.results.IMAGE_DIGEST)
       runAfter:
       - build-container
-      - build-signimage
+      - build-worker
       taskRef:
         params:
         - name: name
