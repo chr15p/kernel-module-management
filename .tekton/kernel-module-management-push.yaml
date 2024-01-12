@@ -257,8 +257,8 @@ spec:
         value: $(params.image-expires-after)
       - name: COMMIT_SHA
         value: $(tasks.clone-repository.results.commit)
-      - name: TARGET
-        value: docker-build
+      - name: BUILDAH_ARGS
+        value: --build-args=TARGET=signimage-build
       runAfter:
       - prefetch-dependencies
       taskRef:
