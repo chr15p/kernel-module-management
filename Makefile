@@ -165,7 +165,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	docker build -t $(IMG) --build-arg TARGET=manager .
+	docker build -t $(IMG) --build-arg TARGET=manager --build-arg VERSION=$(VERSION) .
 
 .PHONY: docker-build-hub
 docker-build-hub: ## Build docker image with the hub manager.

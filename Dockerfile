@@ -22,10 +22,13 @@ COPY Makefile Makefile
 COPY .git .git
 
 ARG TARGET=manager
+ARG VERSION=0.0.2
+ARG TEST
+RUN echo "TEST=${TEST}"
 
 # Build
 RUN git config --global --add safe.directory ${PWD}
-RUN make ${TARGET}
+RUN make ${TARGET} VERSION=${VERSION}
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.3
 

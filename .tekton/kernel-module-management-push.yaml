@@ -221,7 +221,7 @@ spec:
       - name: COMMIT_SHA
         value: $(tasks.clone-repository.results.commit)
       - name: EXTRA_ARGS
-        value: "--build-arg TARGET=signimage-build"
+        value: "--build-arg TARGET=docker-build --build-arg VERSION=2.0.1 --build-arg TEST=$(params.dockerfile)"
       runAfter:
       - prefetch-dependencies
       taskRef:
