@@ -220,8 +220,8 @@ spec:
         value: $(params.image-expires-after)
       - name: COMMIT_SHA
         value: $(tasks.clone-repository.results.commit)
-      - name: TARGET
-        value: docker-build
+      - name: EXTRA_ARGS
+        value: "--build-arg TARGET=signimage-build"
       runAfter:
       - prefetch-dependencies
       taskRef:
@@ -229,7 +229,7 @@ spec:
         - name: name
           value: buildah
         - name: bundle
-          value: quay.io/redhat-appstudio-tekton-catalog/task-buildah:0.1@sha256:16c429b61abb6c6b3b4d96706f329dc88e2a4fb22b6b4fe804ce32e91b561fd7
+          value: quay.io/chrisp262/tekton@sha256:0be3eeff17af5e2138fad60fc6e20217502e8043b16918099564fc75de2c6d6c
         - name: kind
           value: task
         resolver: bundles
@@ -257,8 +257,6 @@ spec:
         value: $(params.image-expires-after)
       - name: COMMIT_SHA
         value: $(tasks.clone-repository.results.commit)
-      - name: EXTRA_ARGS
-        value: "--build-arg TARGET=signimage-build"
       runAfter:
       - prefetch-dependencies
       taskRef:
@@ -266,7 +264,7 @@ spec:
         - name: name
           value: buildah
         - name: bundle
-          value: quay.io/chrisp262/tekton@sha256:0be3eeff17af5e2138fad60fc6e20217502e8043b16918099564fc75de2c6d6c
+          value: quay.io/redhat-appstudio-tekton-catalog/task-buildah:0.1@sha256:16c429b61abb6c6b3b4d96706f329dc88e2a4fb22b6b4fe804ce32e91b561fd7
         - name: kind
           value: task
         resolver: bundles
