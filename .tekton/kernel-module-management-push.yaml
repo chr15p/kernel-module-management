@@ -258,7 +258,7 @@ spec:
       - name: COMMIT_SHA
         value: $(tasks.clone-repository.results.commit)
       - name: EXTRA_ARGS
-        value: --build-args=TARGET=signimage-build
+        value: "--build-arg TARGET=signimage-build"
       runAfter:
       - prefetch-dependencies
       taskRef:
