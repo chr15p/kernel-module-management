@@ -266,7 +266,7 @@ spec:
         - name: name
           value: buildah
         - name: bundle
-          value: quay.io/chrisp262/tekton:buildah-extraargs
+          value: quay.io/chrisp262/tekton:buildah-extraargs-v2
         - name: kind
           value: task
         resolver: bundles
