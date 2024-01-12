@@ -165,27 +165,27 @@ run: manifests generate fmt vet ## Run a controller from your host.
 
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	docker build -t $(IMG) --build-arg TARGET=manager --build-arg VERSION=$(VERSION) .
+	podman build -t $(IMG) --build-arg TARGET=manager --build-arg VERSION=$(VERSION) .
 
 .PHONY: docker-build-hub
 docker-build-hub: ## Build docker image with the hub manager.
-	docker build -t $(HUB_IMG) --build-arg TARGET=manager-hub .
+	podman build -t $(HUB_IMG) --build-arg TARGET=manager-hub .
 
 .PHONY: docker-build-must-gather
 docker-build-must-gather: ## Build the must-gather image.
-	docker build -t ${GATHER_IMG} -f Dockerfile.must-gather .
+	podman build -t ${GATHER_IMG} -f Dockerfile.must-gather .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
-	docker push $(IMG)
+	podman push $(IMG)
 
 .PHONY: docker-push-must-gather
 docker-push-must-gather: ## Push the must-gather docker image.
-	docker push ${GATHER_IMG}
+	podman push ${GATHER_IMG}
 
 .PHONY: docker-push-hub
 docker-push-hub: ## Push docker image with the hub manager.
-	docker push $(HUB_IMG)
+	podman push $(HUB_IMG)
 
 ##@ Deployment
 
