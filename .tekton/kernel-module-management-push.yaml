@@ -23,6 +23,8 @@ spec:
     value: '{{repo_url}}'
   - name: output-image
     value: quay.io/redhat-user-workloads/rhn-gps-cprocter-tenant/kernel-module-management/kernel-module-management:{{revision}}
+  - name: output-image-base
+    value: quay.io/redhat-user-workloads/rhn-gps-cprocter-tenant/kernel-module-management/kernel-module-management
   - name: path-context
     value: .
   - name: revision
