@@ -397,7 +397,7 @@ spec:
     - name: build-must-gather
       params:
       - name: IMAGE
-        VALUE: $(params.output-image-base)-must-gather:on-pr-$(params.revision)
+        value: $(params.output-image-base)-must-gather:on-pr-$(params.revision)
       - name: DOCKERFILE
         value: Dockerfile.must-gather
       - name: CONTEXT
