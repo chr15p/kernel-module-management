@@ -276,7 +276,7 @@ spec:
       workspaces:
       - name: source
         workspace: workspace
-    - name: build-source-image
+    - name: build-source-image-operator
       params:
       - name: BINARY_IMAGE
         value: $(params.output-image)
@@ -429,7 +429,7 @@ spec:
       workspaces:
       - name: source
         workspace: workspace
-    - name: build-source-image
+    - name: build-source-image-must-gather
       params:
       - name: BINARY_IMAGE
         value: $(tasks.build-must-gather.results.IMAGE_URL)
