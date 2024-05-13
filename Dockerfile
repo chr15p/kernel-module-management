@@ -21,7 +21,7 @@ COPY Makefile Makefile
 # Copy the .git directory which is needed to store the build info
 COPY .git .git
 
-ARG TARGET
+ARG TARGET=manager
 
 # Build
 RUN git config --global --add safe.directory ${PWD}
@@ -29,7 +29,7 @@ RUN make ${TARGET}
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.3
 
-ARG TARGET
+ARG TARGET=manager
 
 COPY --from=builder /opt/app-root/src/${TARGET} /usr/local/bin/manager
 
