@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"github.com/budougumi0617/cmpmock"
 	"github.com/mitchellh/hashstructure/v2"
 	. "github.com/onsi/ginkgo/v2"
@@ -18,6 +20,7 @@ import (
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/config"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/constants"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/nmc"
+	"github.com/rh-ecosystem-edge/kernel-module-management/internal/node"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/ocp/ca"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/utils"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/worker"
@@ -36,12 +39,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const nmcName = "nmc"
+const (
+	nmcName     = "nmc"
+	nsFirst     = "example-ns-1"
+	nsSecond    = "example-ns-2"
+	nameFirst   = "example-name-1"
+	nameSecond  = "example-name-2"
+	imageFirst  = "example-image-1"
+	imageSecond = "example-image-2"
+)
 
 var _ = Describe("NodeModulesConfigReconciler_Reconcile", func() {
 	var (
 		kubeClient *testclient.MockClient
 		wh         *MocknmcReconcilerHelper
+		nm         *node.MockNode
 
 		r *NMCReconciler
 
@@ -54,9 +66,11 @@ var _ = Describe("NodeModulesConfigReconciler_Reconcile", func() {
 		ctrl := gomock.NewController(GinkgoT())
 		kubeClient = testclient.NewMockClient(ctrl)
 		wh = NewMocknmcReconcilerHelper(ctrl)
+		nm = node.NewMockNode(ctrl)
 		r = &NMCReconciler{
-			client: kubeClient,
-			helper: wh,
+			client:  kubeClient,
+			helper:  wh,
+			nodeAPI: nm,
 		}
 	})
 
@@ -95,11 +109,58 @@ var _ = Describe("NodeModulesConfigReconciler_Reconcile", func() {
 		Expect(err).To(HaveOccurred())
 	})
 
+	It("should fail if we could not get the node of the NMC", func() {
+		nmc := &kmmv1beta1.NodeModulesConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: nmcName},
+		}
+		node := v1.Node{}
+		gomock.InOrder(
+			kubeClient.
+				EXPECT().
+				Get(ctx, nmcNsn, &kmmv1beta1.NodeModulesConfig{}).
+				Do(func(_ context.Context, _ types.NamespacedName, kubeNmc ctrlclient.Object, _ ...ctrlclient.Options) {
+					*kubeNmc.(*kmmv1beta1.NodeModulesConfig) = *nmc
+				}),
+			wh.EXPECT().SyncStatus(ctx, nmc),
+			kubeClient.EXPECT().Get(ctx, types.NamespacedName{Name: nmc.Name}, &node).Return(fmt.Errorf("some error")),
+		)
+
+		_, err := r.Reconcile(ctx, req)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should not continue if node is not schedulable", func() {
+		nmc := &kmmv1beta1.NodeModulesConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: nmcName},
+		}
+		node := v1.Node{}
+		gomock.InOrder(
+			kubeClient.
+				EXPECT().
+				Get(ctx, nmcNsn, &kmmv1beta1.NodeModulesConfig{}).
+				Do(func(_ context.Context, _ types.NamespacedName, kubeNmc ctrlclient.Object, _ ...ctrlclient.Options) {
+					*kubeNmc.(*kmmv1beta1.NodeModulesConfig) = *nmc
+				}),
+			wh.EXPECT().SyncStatus(ctx, nmc),
+			kubeClient.EXPECT().Get(ctx, types.NamespacedName{Name: nmc.Name}, &node).Return(nil),
+			nm.EXPECT().IsNodeSchedulable(&node).Return(false),
+		)
+
+		_, err := r.Reconcile(ctx, req)
+		Expect(err).To(BeNil())
+	})
+
 	It("should process spec entries and orphan statuses", func() {
 		const (
 			mod0Name = "mod0"
 			mod1Name = "mod1"
 			mod2Name = "mod2"
+		)
+		var (
+			loaded   []types.NamespacedName
+			unloaded []types.NamespacedName
+			err      error
+			node     v1.Node
 		)
 		spec0 := kmmv1beta1.NodeModuleSpec{
 			ModuleItem: kmmv1beta1.ModuleItem{
@@ -151,11 +212,14 @@ var _ = Describe("NodeModulesConfigReconciler_Reconcile", func() {
 					*kubeNmc.(*kmmv1beta1.NodeModulesConfig) = *nmc
 				}),
 			wh.EXPECT().SyncStatus(ctx, nmc),
-			wh.EXPECT().ProcessModuleSpec(contextWithValueMatch, nmc, &spec0, &status0),
-			wh.EXPECT().ProcessModuleSpec(contextWithValueMatch, nmc, &spec1, nil),
-			wh.EXPECT().ProcessUnconfiguredModuleStatus(contextWithValueMatch, nmc, &status2),
+			kubeClient.EXPECT().Get(ctx, types.NamespacedName{Name: nmc.Name}, &node).Return(nil),
+			nm.EXPECT().IsNodeSchedulable(&node).Return(true),
+			wh.EXPECT().ProcessModuleSpec(contextWithValueMatch, nmc, &spec0, &status0, &node),
+			wh.EXPECT().ProcessModuleSpec(contextWithValueMatch, nmc, &spec1, nil, &node),
+			wh.EXPECT().ProcessUnconfiguredModuleStatus(contextWithValueMatch, nmc, &status2, &node),
 			wh.EXPECT().GarbageCollectInUseLabels(ctx, nmc),
-			wh.EXPECT().UpdateNodeLabelsAndRecordEvents(ctx, nmc),
+			wh.EXPECT().UpdateNodeLabels(ctx, nmc, &node).Return(loaded, unloaded, err),
+			wh.EXPECT().RecordEvents(&node, loaded, unloaded),
 		)
 
 		Expect(
@@ -167,10 +231,23 @@ var _ = Describe("NodeModulesConfigReconciler_Reconcile", func() {
 
 	It("should complete all the reconcile functions and return combined error", func() {
 		const (
-			mod0Name = "mod0"
-			mod1Name = "mod1"
-			mod2Name = "mod2"
+			errorMeassge = "some error"
+			mod0Name     = "mod0"
+			mod1Name     = "mod1"
+			mod2Name     = "mod2"
 		)
+		var (
+			node v1.Node
+			err  error
+		)
+
+		expectedErrors := []error{
+			fmt.Errorf("error processing Module %s: %v", namespace+"/"+mod0Name, errorMeassge),
+			fmt.Errorf("error processing orphan status for Module %s: %v", namespace+"/"+mod2Name, errorMeassge),
+			fmt.Errorf("failed to GC in-use labels for NMC %s: %v", types.NamespacedName{Name: nmcName}, errorMeassge),
+			fmt.Errorf("could not update node's labels for NMC %s: %v", types.NamespacedName{Name: nmcName}, errorMeassge),
+		}
+
 		spec0 := kmmv1beta1.NodeModuleSpec{
 			ModuleItem: kmmv1beta1.ModuleItem{
 				Namespace: namespace,
@@ -214,20 +291,23 @@ var _ = Describe("NodeModulesConfigReconciler_Reconcile", func() {
 					*kubeNmc.(*kmmv1beta1.NodeModulesConfig) = *nmc
 				}),
 			wh.EXPECT().SyncStatus(ctx, nmc).Return(nil),
-			wh.EXPECT().ProcessModuleSpec(contextWithValueMatch, nmc, &spec0, &status0).Return(fmt.Errorf("some error")),
-			wh.EXPECT().ProcessUnconfiguredModuleStatus(contextWithValueMatch, nmc, &status2).Return(fmt.Errorf("some error")),
-			wh.EXPECT().GarbageCollectInUseLabels(ctx, nmc).Return(fmt.Errorf("some error")),
-			wh.EXPECT().UpdateNodeLabelsAndRecordEvents(ctx, nmc).Return(fmt.Errorf("some error")),
+			kubeClient.EXPECT().Get(ctx, types.NamespacedName{Name: nmc.Name}, &node).Return(nil),
+			nm.EXPECT().IsNodeSchedulable(&node).Return(true),
+			wh.EXPECT().ProcessModuleSpec(contextWithValueMatch, nmc, &spec0, &status0, &node).Return(fmt.Errorf(errorMeassge)),
+			wh.EXPECT().ProcessUnconfiguredModuleStatus(contextWithValueMatch, nmc, &status2, &node).Return(fmt.Errorf(errorMeassge)),
+			wh.EXPECT().GarbageCollectInUseLabels(ctx, nmc).Return(fmt.Errorf(errorMeassge)),
+			wh.EXPECT().UpdateNodeLabels(ctx, nmc, &node).Return(nil, nil, fmt.Errorf(errorMeassge)),
 		)
 
-		_, err := r.Reconcile(ctx, req)
-		Expect(err).ToNot(BeNil())
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).To(Equal(errors.Join(expectedErrors...)))
 	})
 })
 
 var moduleConfig = kmmv1beta1.ModuleConfig{
-	KernelVersion:         "kernel version",
+	KernelVersion:         "kernel-version",
 	ContainerImage:        "container image",
+	ImagePullPolicy:       v1.PullIfNotPresent,
 	InsecurePull:          true,
 	InTreeModulesToRemove: []string{"intree1", "intree2"},
 	Modprobe: kmmv1beta1.ModprobeSpec{
@@ -253,7 +333,7 @@ var _ = Describe("nmcReconcilerHelperImpl_GarbageCollectInUseLabels", func() {
 		ctrl := gomock.NewController(GinkgoT())
 		client = testclient.NewMockClient(ctrl)
 		pm = NewMockpodManager(ctrl)
-		wh = newNMCReconcilerHelper(client, pm, nil)
+		wh = newNMCReconcilerHelper(client, pm, nil, nil)
 	})
 
 	It("should do nothing if no labels should be collected", func() {
@@ -363,13 +443,15 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 		client *testclient.MockClient
 		pm     *MockpodManager
 		wh     nmcReconcilerHelper
+		nm     *node.MockNode
 	)
 
 	BeforeEach(func() {
 		ctrl := gomock.NewController(GinkgoT())
 		client = testclient.NewMockClient(ctrl)
 		pm = NewMockpodManager(ctrl)
-		wh = newNMCReconcilerHelper(client, pm, nil)
+		nm = node.NewMockNode(ctrl)
+		wh = newNMCReconcilerHelper(client, pm, nil, nm)
 	})
 
 	It("should create a loader Pod if there is no existing Pod and the status is missing", func() {
@@ -389,13 +471,13 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 		)
 
 		Expect(
-			wh.ProcessModuleSpec(ctx, nmc, spec, nil),
+			wh.ProcessModuleSpec(ctx, nmc, spec, nil, nil),
 		).NotTo(
 			HaveOccurred(),
 		)
 	})
 
-	It("should create an unloader Pod if the spec is different from the status", func() {
+	It("should create an unloader Pod if the spec is different from the status and kernels are equal", func() {
 		nmc := &kmmv1beta1.NodeModulesConfig{
 			ObjectMeta: metav1.ObjectMeta{Name: nmcName},
 		}
@@ -405,7 +487,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 				Name:      name,
 				Namespace: namespace,
 			},
-			Config: kmmv1beta1.ModuleConfig{ContainerImage: "old-container-image"},
+			Config: kmmv1beta1.ModuleConfig{ContainerImage: "old-container-image", KernelVersion: "same kernel"},
 		}
 
 		status := &kmmv1beta1.NodeModuleStatus{
@@ -413,7 +495,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 				Name:      name,
 				Namespace: namespace,
 			},
-			Config: kmmv1beta1.ModuleConfig{ContainerImage: "new-container-image"},
+			Config: kmmv1beta1.ModuleConfig{ContainerImage: "new-container-image", KernelVersion: "same kernel"},
 		}
 
 		gomock.InOrder(
@@ -422,51 +504,13 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 		)
 
 		Expect(
-			wh.ProcessModuleSpec(ctx, nmc, spec, status),
+			wh.ProcessModuleSpec(ctx, nmc, spec, status, nil),
 		).NotTo(
 			HaveOccurred(),
 		)
 	})
 
-	It("should return an error if we could not get the node", func() {
-		nmc := &kmmv1beta1.NodeModulesConfig{
-			ObjectMeta: metav1.ObjectMeta{Name: nmcName},
-		}
-
-		cfg := kmmv1beta1.ModuleConfig{ContainerImage: "some-image"}
-
-		spec := &kmmv1beta1.NodeModuleSpec{
-			ModuleItem: kmmv1beta1.ModuleItem{
-				Name:      name,
-				Namespace: namespace,
-			},
-			Config: cfg,
-		}
-
-		status := &kmmv1beta1.NodeModuleStatus{
-			ModuleItem: kmmv1beta1.ModuleItem{
-				Name:      name,
-				Namespace: namespace,
-			},
-			Config: cfg,
-		}
-
-		gomock.InOrder(
-			pm.EXPECT().GetWorkerPod(ctx, podName, namespace),
-			client.
-				EXPECT().
-				Get(ctx, types.NamespacedName{Name: nmcName}, &v1.Node{}).
-				Return(errors.New("random error")),
-		)
-
-		Expect(
-			wh.ProcessModuleSpec(ctx, nmc, spec, status),
-		).To(
-			HaveOccurred(),
-		)
-	})
-
-	It("should return an error if the node has no ready condition", func() {
+	It("should create an loader Pod if the spec is different from the status and kernels different equal", func() {
 		nmc := &kmmv1beta1.NodeModulesConfig{
 			ObjectMeta: metav1.ObjectMeta{Name: nmcName},
 		}
@@ -476,7 +520,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 				Name:      name,
 				Namespace: namespace,
 			},
-			Config: moduleConfig,
+			Config: kmmv1beta1.ModuleConfig{ContainerImage: "old-container-image", KernelVersion: "old kernel"},
 		}
 
 		status := &kmmv1beta1.NodeModuleStatus{
@@ -484,18 +528,17 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 				Name:      name,
 				Namespace: namespace,
 			},
-			Config:             moduleConfig,
-			LastTransitionTime: metav1.Now(),
+			Config: kmmv1beta1.ModuleConfig{ContainerImage: "new-container-image", KernelVersion: "new kernel"},
 		}
 
 		gomock.InOrder(
 			pm.EXPECT().GetWorkerPod(ctx, podName, namespace),
-			client.EXPECT().Get(ctx, types.NamespacedName{Name: nmcName}, &v1.Node{}),
+			pm.EXPECT().CreateLoaderPod(ctx, nmc, spec),
 		)
 
 		Expect(
-			wh.ProcessModuleSpec(ctx, nmc, spec, status),
-		).To(
+			wh.ProcessModuleSpec(ctx, nmc, spec, status, nil),
+		).NotTo(
 			HaveOccurred(),
 		)
 	})
@@ -511,6 +554,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 			Namespace: namespace,
 		},
 	}
+	node := &v1.Node{}
 
 	now := metav1.Now()
 
@@ -525,38 +569,30 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 
 	DescribeTable(
 		"should create a loader Pod if status is older than the Ready condition",
-		func(cs v1.ConditionStatus, shouldCreate bool) {
+		func(shouldCreate bool) {
 
-			getPod := pm.
-				EXPECT().
-				GetWorkerPod(ctx, podName, namespace)
+			returnValue := false
+			if shouldCreate {
+				returnValue = true
+			}
 
-			getNode := client.
-				EXPECT().
-				Get(ctx, types.NamespacedName{Name: nmcName}, &v1.Node{}).
-				Do(func(_ context.Context, _ types.NamespacedName, node *v1.Node, _ ...ctrl.Options) {
-					node.Status.Conditions = []v1.NodeCondition{
-						{
-							Type:               v1.NodeReady,
-							Status:             cs,
-							LastTransitionTime: now,
-						},
-					}
-				}).
-				After(getPod)
+			gomock.InOrder(
+				pm.EXPECT().GetWorkerPod(ctx, podName, namespace),
+				nm.EXPECT().NodeBecomeReadyAfter(node, status.LastTransitionTime).Return(returnValue),
+			)
 
 			if shouldCreate {
-				pm.EXPECT().CreateLoaderPod(ctx, nmc, spec).After(getNode)
+				pm.EXPECT().CreateLoaderPod(ctx, nmc, spec)
 			}
 
 			Expect(
-				wh.ProcessModuleSpec(ctx, nmc, spec, status),
+				wh.ProcessModuleSpec(ctx, nmc, spec, status, node),
 			).NotTo(
 				HaveOccurred(),
 			)
 		},
-		Entry(nil, v1.ConditionFalse, false),
-		Entry(nil, v1.ConditionTrue, true),
+		Entry("pod status is newer then node's Ready condition, worker pod should not be created", false),
+		Entry("pod status is older then node's Ready condition, worker pod should be created", true),
 	)
 
 	It("should do nothing if the pod is not loading a kmod", func() {
@@ -566,7 +602,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 			Return(&v1.Pod{}, nil)
 
 		Expect(
-			wh.ProcessModuleSpec(ctx, nmc, spec, status),
+			wh.ProcessModuleSpec(ctx, nmc, spec, status, nil),
 		).NotTo(
 			HaveOccurred(),
 		)
@@ -585,7 +621,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 			Return(&pod, nil)
 
 		Expect(
-			wh.ProcessModuleSpec(ctx, nmc, spec, status),
+			wh.ProcessModuleSpec(ctx, nmc, spec, status, nil),
 		).NotTo(
 			HaveOccurred(),
 		)
@@ -618,7 +654,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 		)
 
 		Expect(
-			wh.ProcessModuleSpec(ctx, nmc, spec, status),
+			wh.ProcessModuleSpec(ctx, nmc, spec, status, nil),
 		).To(
 			HaveOccurred(),
 		)
@@ -658,7 +694,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessModuleSpec", func() {
 		)
 
 		Expect(
-			wh.ProcessModuleSpec(ctx, nmc, spec, status),
+			wh.ProcessModuleSpec(ctx, nmc, spec, status, nil),
 		).NotTo(
 			HaveOccurred(),
 		)
@@ -674,6 +710,7 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessUnconfiguredModuleStatus", func
 
 		client *testclient.MockClient
 		pm     *MockpodManager
+		nm     *node.MockNode
 		helper nmcReconcilerHelper
 	)
 
@@ -681,7 +718,8 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessUnconfiguredModuleStatus", func
 		ctrl := gomock.NewController(GinkgoT())
 		client = testclient.NewMockClient(ctrl)
 		pm = NewMockpodManager(ctrl)
-		helper = newNMCReconcilerHelper(client, pm, nil)
+		nm = node.NewMockNode(ctrl)
+		helper = newNMCReconcilerHelper(client, pm, nil, nm)
 	})
 
 	nmc := &kmmv1beta1.NodeModulesConfig{
@@ -695,14 +733,27 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessUnconfiguredModuleStatus", func
 		},
 	}
 
+	node := v1.Node{}
+
+	It("should do nothing , if the node has been rebooted/ready lately", func() {
+		nm.EXPECT().NodeBecomeReadyAfter(&node, status.LastTransitionTime).Return(true)
+
+		Expect(
+			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status, &node),
+		).NotTo(
+			HaveOccurred(),
+		)
+	})
+
 	It("should create an unloader Pod if no worker Pod exists", func() {
 		gomock.InOrder(
+			nm.EXPECT().NodeBecomeReadyAfter(&node, status.LastTransitionTime).Return(false),
 			pm.EXPECT().GetWorkerPod(ctx, podName, namespace),
 			pm.EXPECT().CreateUnloaderPod(ctx, nmc, status),
 		)
 
 		Expect(
-			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status),
+			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status, &node),
 		).NotTo(
 			HaveOccurred(),
 		)
@@ -718,12 +769,13 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessUnconfiguredModuleStatus", func
 		}
 
 		gomock.InOrder(
+			nm.EXPECT().NodeBecomeReadyAfter(&node, status.LastTransitionTime).Return(false),
 			pm.EXPECT().GetWorkerPod(ctx, podName, namespace).Return(&pod, nil),
 			pm.EXPECT().DeletePod(ctx, &pod),
 		)
 
 		Expect(
-			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status),
+			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status, &node),
 		).NotTo(
 			HaveOccurred(),
 		)
@@ -737,10 +789,13 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessUnconfiguredModuleStatus", func
 			},
 		}
 
-		pm.EXPECT().GetWorkerPod(ctx, podName, namespace).Return(&pod, nil)
+		gomock.InOrder(
+			nm.EXPECT().NodeBecomeReadyAfter(&node, status.LastTransitionTime).Return(false),
+			pm.EXPECT().GetWorkerPod(ctx, podName, namespace).Return(&pod, nil),
+		)
 
 		Expect(
-			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status),
+			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status, &node),
 		).NotTo(
 			HaveOccurred(),
 		)
@@ -763,12 +818,13 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessUnconfiguredModuleStatus", func
 		}
 
 		gomock.InOrder(
+			nm.EXPECT().NodeBecomeReadyAfter(&node, status.LastTransitionTime).Return(false),
 			pm.EXPECT().GetWorkerPod(ctx, podName, namespace).Return(&pod, nil),
 			pm.EXPECT().UnloaderPodTemplate(ctx, nmc, status).Return(nil, errors.New("random error")),
 		)
 
 		Expect(
-			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status),
+			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status, &node),
 		).To(
 			HaveOccurred(),
 		)
@@ -795,13 +851,14 @@ var _ = Describe("nmcReconcilerHelperImpl_ProcessUnconfiguredModuleStatus", func
 		podTemplate.Annotations[hashAnnotationKey] = "456"
 
 		gomock.InOrder(
+			nm.EXPECT().NodeBecomeReadyAfter(&node, status.LastTransitionTime).Return(false),
 			pm.EXPECT().GetWorkerPod(ctx, podName, namespace).Return(&pod, nil),
 			pm.EXPECT().UnloaderPodTemplate(ctx, nmc, status).Return(podTemplate, nil),
 			pm.EXPECT().DeletePod(ctx, &pod),
 		)
 
 		Expect(
-			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status),
+			helper.ProcessUnconfiguredModuleStatus(ctx, nmc, status, &node),
 		).NotTo(
 			HaveOccurred(),
 		)
@@ -824,7 +881,7 @@ var _ = Describe("nmcReconcilerHelperImpl_SyncStatus", func() {
 		ctrl = gomock.NewController(GinkgoT())
 		kubeClient = testclient.NewMockClient(ctrl)
 		pm = NewMockpodManager(ctrl)
-		wh = newNMCReconcilerHelper(kubeClient, pm, nil)
+		wh = newNMCReconcilerHelper(kubeClient, pm, nil, nil)
 		sw = testclient.NewMockStatusWriter(ctrl)
 	})
 
@@ -1110,7 +1167,7 @@ var _ = Describe("nmcReconcilerHelperImpl_RemovePodFinalizers", func() {
 		ctrl := gomock.NewController(GinkgoT())
 		kubeClient = testclient.NewMockClient(ctrl)
 		pm = NewMockpodManager(ctrl)
-		wh = newNMCReconcilerHelper(kubeClient, pm, nil)
+		wh = newNMCReconcilerHelper(kubeClient, pm, nil, nil)
 	})
 
 	It("should do nothing if no pods are present", func() {
@@ -1156,39 +1213,146 @@ var _ = Describe("nmcReconcilerHelperImpl_RemovePodFinalizers", func() {
 const (
 	moduleName      = "my-module"
 	moduleNamespace = "my-module-namespace"
+	nodeName        = "node-name"
 )
 
-var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func() {
+var kernelModuleLabelName = utils.GetKernelModuleReadyNodeLabel(moduleNamespace, moduleName)
+
+var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabels", func() {
 	var (
-		ctx          = context.TODO()
+		ctx             context.Context
+		client          *testclient.MockClient
+		fakeRecorder    *record.FakeRecorder
+		n               *node.MockNode
+		nmc             kmmv1beta1.NodeModulesConfig
+		wh              nmcReconcilerHelper
+		mlph            *MocklabelPreparationHelper
+		firstLabelName  string
+		secondLabelName string
+	)
+
+	BeforeEach(func() {
+		ctx = context.TODO()
+		ctrl := gomock.NewController(GinkgoT())
+		client = testclient.NewMockClient(ctrl)
+		nmc = kmmv1beta1.NodeModulesConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "nmcName"},
+			Spec: kmmv1beta1.NodeModulesConfigSpec{
+				Modules: []kmmv1beta1.NodeModuleSpec{
+					{
+						ModuleItem: kmmv1beta1.ModuleItem{
+							Namespace: nsFirst,
+							Name:      nameFirst,
+						},
+						Config: kmmv1beta1.ModuleConfig{},
+					},
+					{
+						ModuleItem: kmmv1beta1.ModuleItem{
+							Namespace: nsSecond,
+							Name:      nameSecond,
+						},
+						Config: kmmv1beta1.ModuleConfig{},
+					},
+				},
+			},
+		}
+		fakeRecorder = record.NewFakeRecorder(10)
+		n = node.NewMockNode(ctrl)
+		wh = newNMCReconcilerHelper(client, nil, fakeRecorder, n)
+		mlph = NewMocklabelPreparationHelper(ctrl)
+		wh = &nmcReconcilerHelperImpl{
+			client:   client,
+			pm:       nil,
+			recorder: fakeRecorder,
+			nodeAPI:  n,
+			lph:      mlph,
+		}
+		firstLabelName = fmt.Sprintf("kmm.node.kubernetes.io/%s.%s.ready", nsFirst, nameFirst)
+		secondLabelName = fmt.Sprintf("kmm.node.kubernetes.io/%s.%s.ready", nsSecond, nameSecond)
+	})
+
+	It("failed to get node", func() {
+		client.EXPECT().Get(ctx, gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("some error"))
+		err := client.Get(ctx, types.NamespacedName{Name: nmc.Name}, &v1.Node{})
+		Expect(err).To(HaveOccurred())
+	})
+	It("Should fail patching node after change in labels", func() {
+		node := v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					firstLabelName: "",
+				},
+				Name: nodeName,
+			},
+		}
+		emptySet := sets.Set[types.NamespacedName]{}
+		emptyMap := map[types.NamespacedName]kmmv1beta1.ModuleConfig{}
+
+		gomock.InOrder(
+			mlph.EXPECT().getNodeKernelModuleReadyLabels(node).Return(emptySet),
+			mlph.EXPECT().getDeprecatedKernelModuleReadyLabels(node).Return(sets.Set[string]{}),
+			mlph.EXPECT().getSpecLabelsAndTheirConfigs(&nmc).Return(emptyMap),
+			mlph.EXPECT().getStatusLabelsAndTheirConfigs(&nmc).Return(emptyMap),
+			mlph.EXPECT().removeOrphanedLabels(emptySet, emptyMap, emptyMap).Return([]types.NamespacedName{{Name: nameSecond, Namespace: nsSecond}}),
+			mlph.EXPECT().addEqualLabels(emptySet, emptyMap, emptyMap).Return([]types.NamespacedName{{Name: nameFirst, Namespace: nsFirst}}),
+			n.EXPECT().
+				UpdateLabels(
+					ctx,
+					&node,
+					[]string{firstLabelName},
+					[]string{secondLabelName},
+				).Return(fmt.Errorf("some error")),
+		)
+		_, _, err := wh.UpdateNodeLabels(ctx, &nmc, &node)
+		Expect(err).To(HaveOccurred())
+	})
+	It("Should work as expected", func() {
+		node := v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					firstLabelName: "",
+				},
+				Name: nodeName,
+			},
+		}
+		emptySet := sets.Set[types.NamespacedName]{}
+		emptyMap := map[types.NamespacedName]kmmv1beta1.ModuleConfig{}
+
+		gomock.InOrder(
+			mlph.EXPECT().getNodeKernelModuleReadyLabels(node).Return(emptySet),
+			mlph.EXPECT().getDeprecatedKernelModuleReadyLabels(node).Return(sets.Set[string]{}),
+			mlph.EXPECT().getSpecLabelsAndTheirConfigs(&nmc).Return(emptyMap),
+			mlph.EXPECT().getStatusLabelsAndTheirConfigs(&nmc).Return(emptyMap),
+			mlph.EXPECT().removeOrphanedLabels(emptySet, emptyMap, emptyMap).Return([]types.NamespacedName{{Name: nameSecond, Namespace: nsSecond}}),
+			mlph.EXPECT().addEqualLabels(emptySet, emptyMap, emptyMap).Return([]types.NamespacedName{{Name: nameFirst, Namespace: nsFirst}}),
+			n.EXPECT().
+				UpdateLabels(
+					ctx,
+					&node,
+					[]string{firstLabelName},
+					[]string{secondLabelName},
+				).Return(nil),
+		)
+		_, _, err := wh.UpdateNodeLabels(ctx, &nmc, &node)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(node.Labels).To(HaveKey(firstLabelName))
+
+	})
+})
+
+var _ = Describe("nmcReconcilerHelperImpl_RecordEvents", func() {
+	var (
 		client       *testclient.MockClient
-		expectedNode v1.Node
 		fakeRecorder *record.FakeRecorder
-		nmc          kmmv1beta1.NodeModulesConfig
 		wh           nmcReconcilerHelper
 	)
 
 	BeforeEach(func() {
 		ctrl := gomock.NewController(GinkgoT())
 		client = testclient.NewMockClient(ctrl)
-		expectedNode = v1.Node{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:   "node name",
-				Labels: map[string]string{},
-			},
-		}
-		nmc = kmmv1beta1.NodeModulesConfig{
-			ObjectMeta: metav1.ObjectMeta{Name: "nmcName"},
-		}
 		fakeRecorder = record.NewFakeRecorder(10)
-		wh = newNMCReconcilerHelper(client, nil, fakeRecorder)
+		wh = newNMCReconcilerHelper(client, nil, fakeRecorder, nil)
 	})
-
-	moduleConfig := kmmv1beta1.ModuleConfig{
-		KernelVersion:         "some version",
-		ContainerImage:        "some image",
-		InTreeModulesToRemove: []string{"some kernel module"},
-	}
 
 	closeAndGetAllEvents := func(events chan string) []string {
 		elems := make([]string, 0)
@@ -1204,13 +1368,6 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 
 	_ = closeAndGetAllEvents(make(chan string))
 
-	It("failed to get node", func() {
-		client.EXPECT().Get(ctx, gomock.Any(), gomock.Any()).Return(fmt.Errorf("some error"))
-
-		err := wh.UpdateNodeLabelsAndRecordEvents(ctx, &nmc)
-		Expect(err).To(HaveOccurred())
-	})
-
 	type testCase struct {
 		nodeLabelPresent    bool
 		specPresent         bool
@@ -1223,61 +1380,10 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 	}
 
 	DescribeTable(
-		"nodes labels scenarios",
-		func(tc testCase) {
-			nodeLabels := map[string]string{"kmm.node.kubernetes.io/deprecated-label.ready": ""}
+		"RecordEvents different scenarios",
+		func(tc testCase, loaded []types.NamespacedName, unloaded []types.NamespacedName, node v1.Node) {
 
-			if tc.nodeLabelPresent {
-				nodeLabels[utils.GetKernelModuleReadyNodeLabel(moduleNamespace, moduleName)] = ""
-			}
-			if tc.specPresent {
-				nmc.Spec.Modules = []kmmv1beta1.NodeModuleSpec{
-					{
-						ModuleItem: kmmv1beta1.ModuleItem{
-							Name:      moduleName,
-							Namespace: moduleNamespace,
-						},
-						Config: moduleConfig,
-					},
-				}
-			}
-			if tc.statusPresent {
-				nmc.Status.Modules = []kmmv1beta1.NodeModuleStatus{
-					{
-						ModuleItem: kmmv1beta1.ModuleItem{
-							Name:      moduleName,
-							Namespace: moduleNamespace,
-						},
-					},
-				}
-				if tc.statusConfigPresent {
-					statusConfig := moduleConfig
-					if !tc.configsEqual {
-						statusConfig.ContainerImage = "some other container image"
-					}
-					nmc.Status.Modules[0].Config = statusConfig
-				}
-			}
-
-			if tc.resultLabelPresent {
-				resultLabels := map[string]string{utils.GetKernelModuleReadyNodeLabel(moduleNamespace, moduleName): ""}
-				expectedNode.SetLabels(resultLabels)
-			}
-
-			gomock.InOrder(
-				client.EXPECT().Get(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
-					func(_ interface{}, _ interface{}, node *v1.Node, _ ...ctrlclient.GetOption) error {
-						node.SetName("node name")
-						node.SetLabels(nodeLabels)
-						return nil
-					},
-				),
-				client.EXPECT().Patch(ctx, &expectedNode, gomock.Any()).Return(nil),
-			)
-
-			err := wh.UpdateNodeLabelsAndRecordEvents(ctx, &nmc)
-			Expect(err).NotTo(HaveOccurred())
-
+			wh.RecordEvents(&node, loaded, unloaded)
 			events := closeAndGetAllEvents(fakeRecorder.Events)
 
 			if !tc.addsReadyLabel && !tc.removesReadyLabel {
@@ -1301,6 +1407,14 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 				nodeLabelPresent:  true,
 				removesReadyLabel: true,
 			},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{{Namespace: moduleNamespace, Name: moduleName}},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{},
+					Name:   nodeName,
+				},
+			},
 		),
 		Entry(
 			"node label present, spec present, status missing",
@@ -1308,6 +1422,16 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 				nodeLabelPresent:   true,
 				specPresent:        true,
 				resultLabelPresent: true,
+			},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						kernelModuleLabelName: "",
+					},
+					Name: nodeName,
+				},
 			},
 		),
 		Entry(
@@ -1318,6 +1442,16 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 				statusPresent:      true,
 				resultLabelPresent: true,
 			},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						kernelModuleLabelName: "",
+					},
+					Name: nodeName,
+				},
+			},
 		),
 		Entry(
 			"node label present, spec present, status present, status config present, configs not equal",
@@ -1327,6 +1461,16 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 				statusPresent:       true,
 				statusConfigPresent: true,
 				resultLabelPresent:  true,
+			},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						kernelModuleLabelName: "",
+					},
+					Name: nodeName,
+				},
 			},
 		),
 		Entry(
@@ -1339,20 +1483,54 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 				configsEqual:        true,
 				resultLabelPresent:  true,
 			},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						kernelModuleLabelName: "",
+					},
+					Name: nodeName,
+				},
+			},
 		),
 		Entry(
 			"node label missing, spec missing, status missing",
 			testCase{},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{},
+					Name:   nodeName,
+				},
+			},
 		),
 		Entry(
 			"node label missing, spec present, status missing",
 			testCase{specPresent: true},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{},
+					Name:   nodeName,
+				},
+			},
 		),
 		Entry(
 			"node label missing, spec present, status present, status config missing",
 			testCase{
 				specPresent:   true,
 				statusPresent: true,
+			},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{},
+					Name:   nodeName,
+				},
 			},
 		),
 		Entry(
@@ -1361,6 +1539,14 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 				specPresent:         true,
 				statusPresent:       true,
 				statusConfigPresent: true,
+			},
+			[]types.NamespacedName{},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{},
+					Name:   nodeName,
+				},
 			},
 		),
 		Entry(
@@ -1372,6 +1558,16 @@ var _ = Describe("nmcReconcilerHelperImpl_UpdateNodeLabelsAndRecordEvents", func
 				configsEqual:        true,
 				resultLabelPresent:  true,
 				addsReadyLabel:      true,
+			},
+			[]types.NamespacedName{{Namespace: moduleNamespace, Name: moduleName}},
+			[]types.NamespacedName{},
+			v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						kernelModuleLabelName: "",
+					},
+					Name: nodeName,
+				},
 			},
 		),
 	)
@@ -1400,28 +1596,83 @@ var (
 )
 
 var _ = Describe("podManagerImpl_CreateLoaderPod", func() {
+
+	const irsName = "some-secret"
+
+	var (
+		ctrl   *gomock.Controller
+		client *testclient.MockClient
+		psh    *MockpullSecretHelper
+
+		nmc *kmmv1beta1.NodeModulesConfig
+		mi  kmmv1beta1.ModuleItem
+
+		ctx               context.Context
+		moduleConfigToUse kmmv1beta1.ModuleConfig
+		caHelper          *ca.MockHelper
+	)
+
+	BeforeEach(func() {
+
+		ctrl = gomock.NewController(GinkgoT())
+		client = testclient.NewMockClient(ctrl)
+		psh = NewMockpullSecretHelper(ctrl)
+		caHelper = ca.NewMockHelper(ctrl)
+
+		nmc = &kmmv1beta1.NodeModulesConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: nmcName},
+		}
+
+		mi = kmmv1beta1.ModuleItem{
+			ImageRepoSecret:    &v1.LocalObjectReference{Name: irsName},
+			Name:               moduleName,
+			Namespace:          namespace,
+			ServiceAccountName: serviceAccountName,
+		}
+
+		moduleConfigToUse = moduleConfig
+		ctx = context.TODO()
+	})
+
+	It("it should fail if firmwareHostPath was not set but firmware loading was", func() {
+
+		moduleConfigToUse.Modprobe.FirmwarePath = "/firmware-path"
+
+		nms := &kmmv1beta1.NodeModuleSpec{
+			ModuleItem: mi,
+			Config:     moduleConfigToUse,
+		}
+
+		pm := &podManagerImpl{
+			client:      client,
+			psh:         psh,
+			scheme:      scheme,
+			workerImage: workerImage,
+			workerCfg:   workerCfg,
+			caHelper:    caHelper,
+		}
+
+		gomock.InOrder(
+			psh.EXPECT().VolumesAndVolumeMounts(ctx, &mi),
+			caHelper.EXPECT().GetClusterCA(ctx, namespace).Return(clusterCACM, nil),
+			caHelper.EXPECT().GetServiceCA(ctx, namespace).Return(serviceCACM, nil),
+		)
+
+		Expect(
+			pm.CreateLoaderPod(ctx, nmc, nms),
+		).To(
+			HaveOccurred(),
+		)
+	})
+
 	DescribeTable(
 		"should work as expected",
-		func(firmwareClassPath *string, withFirmwareLoading bool) {
+		func(firmwareHostPath *string, withFirmwareLoading bool) {
 			ctrl := gomock.NewController(GinkgoT())
 			client := testclient.NewMockClient(ctrl)
 			psh := NewMockpullSecretHelper(ctrl)
 			caHelper := ca.NewMockHelper(ctrl)
 
-			nmc := &kmmv1beta1.NodeModulesConfig{
-				ObjectMeta: metav1.ObjectMeta{Name: nmcName},
-			}
-
-			const irsName = "some-secret"
-
-			mi := kmmv1beta1.ModuleItem{
-				ImageRepoSecret:    &v1.LocalObjectReference{Name: irsName},
-				Name:               moduleName,
-				Namespace:          namespace,
-				ServiceAccountName: serviceAccountName,
-			}
-
-			moduleConfigToUse := moduleConfig
 			if withFirmwareLoading {
 				moduleConfigToUse.Modprobe.FirmwarePath = "/firmware-path"
 			}
@@ -1431,7 +1682,7 @@ var _ = Describe("podManagerImpl_CreateLoaderPod", func() {
 				Config:     moduleConfigToUse,
 			}
 
-			expected := getBaseWorkerPod("load", WorkerActionLoad, nmc, firmwareClassPath, withFirmwareLoading)
+			expected := getBaseWorkerPod("load", nmc, firmwareHostPath, withFirmwareLoading, true)
 
 			Expect(
 				controllerutil.SetControllerReference(nmc, expected, scheme),
@@ -1444,7 +1695,7 @@ var _ = Describe("podManagerImpl_CreateLoaderPod", func() {
 			container, _ := podcmd.FindContainerByName(expected, "worker")
 			Expect(container).NotTo(BeNil())
 
-			if firmwareClassPath != nil {
+			if withFirmwareLoading && firmwareHostPath != nil {
 				container.SecurityContext = &v1.SecurityContext{
 					Privileged: ptr.To(true),
 				}
@@ -1463,8 +1714,6 @@ var _ = Describe("podManagerImpl_CreateLoaderPod", func() {
 
 			expected.Annotations[hashAnnotationKey] = fmt.Sprintf("%d", hash)
 
-			ctx := context.TODO()
-
 			gomock.InOrder(
 				psh.EXPECT().VolumesAndVolumeMounts(ctx, &mi),
 				caHelper.EXPECT().GetClusterCA(ctx, namespace).Return(clusterCACM, nil),
@@ -1473,7 +1722,7 @@ var _ = Describe("podManagerImpl_CreateLoaderPod", func() {
 			)
 
 			workerCfg := *workerCfg
-			workerCfg.SetFirmwareClassPath = firmwareClassPath
+			workerCfg.FirmwareHostPath = firmwareHostPath
 
 			pm := &podManagerImpl{
 				caHelper:    caHelper,
@@ -1490,39 +1739,79 @@ var _ = Describe("podManagerImpl_CreateLoaderPod", func() {
 				HaveOccurred(),
 			)
 		},
-		Entry("pod without firmwareClassPath, without firmware loading", nil, false),
-		Entry("pod with empty firmwareClassPath, without firmware loading", ptr.To(""), false),
-		Entry("pod with firmwareClassPath, without firmware loading", ptr.To("some-path"), false),
-		Entry("pod with firmwareClassPath, with firmware loading", ptr.To("some-path"), true),
-		Entry("pod without firmwareClassPath, with firmware loading", nil, true),
+		Entry("firmwareHostPath not set, firmware loading not requested", nil, false),
+		Entry("firmwareHostPath set to empty string, firmware loading not requested", ptr.To(""), false),
+		Entry("firmwareHostPath set, firmware loading not requested", ptr.To("some-path"), false),
+		Entry("firmwareHostPath set , firmware loading requested", ptr.To("some-path"), true),
 	)
 })
 
 var _ = Describe("podManagerImpl_CreateUnloaderPod", func() {
-	It("should work as expected", func() {
-		ctrl := gomock.NewController(GinkgoT())
-		client := testclient.NewMockClient(ctrl)
-		psh := NewMockpullSecretHelper(ctrl)
-		caHelper := ca.NewMockHelper(ctrl)
 
-		nmc := &kmmv1beta1.NodeModulesConfig{
+	const irsName = "some-secret"
+
+	var (
+		ctrl   *gomock.Controller
+		client *testclient.MockClient
+		psh    *MockpullSecretHelper
+
+		nmc *kmmv1beta1.NodeModulesConfig
+		mi  kmmv1beta1.ModuleItem
+
+		ctx               context.Context
+		moduleConfigToUse kmmv1beta1.ModuleConfig
+		status            *kmmv1beta1.NodeModuleStatus
+		caHelper          *ca.MockHelper
+	)
+
+	BeforeEach(func() {
+
+		ctrl = gomock.NewController(GinkgoT())
+		client = testclient.NewMockClient(ctrl)
+		psh = NewMockpullSecretHelper(ctrl)
+		caHelper = ca.NewMockHelper(ctrl)
+
+		nmc = &kmmv1beta1.NodeModulesConfig{
 			ObjectMeta: metav1.ObjectMeta{Name: nmcName},
 		}
 
-		mi := kmmv1beta1.ModuleItem{
+		mi = kmmv1beta1.ModuleItem{
+			ImageRepoSecret:    &v1.LocalObjectReference{Name: irsName},
 			Name:               moduleName,
 			Namespace:          namespace,
 			ServiceAccountName: serviceAccountName,
 		}
 
-		moduleConfigToUse := moduleConfig
+		moduleConfigToUse = moduleConfig
 		moduleConfigToUse.Modprobe.FirmwarePath = "/firmware-path"
-		status := &kmmv1beta1.NodeModuleStatus{
+		status = &kmmv1beta1.NodeModuleStatus{
 			ModuleItem: mi,
 			Config:     moduleConfigToUse,
 		}
+		ctx = context.TODO()
+	})
 
-		expected := getBaseWorkerPod("unload", WorkerActionUnload, nmc, nil, true)
+	It("it should fail if firmwareClassPath was not set but firmware loading was", func() {
+
+		pm := newPodManager(client, workerImage, scheme, caHelper, workerCfg)
+		pm.(*podManagerImpl).psh = psh
+
+		gomock.InOrder(
+			psh.EXPECT().VolumesAndVolumeMounts(ctx, &mi),
+			caHelper.EXPECT().GetClusterCA(ctx, namespace).Return(clusterCACM, nil),
+			caHelper.EXPECT().GetServiceCA(ctx, namespace).Return(serviceCACM, nil),
+		)
+
+		Expect(
+			pm.CreateUnloaderPod(ctx, nmc, status),
+		).To(
+			HaveOccurred(),
+		)
+	})
+
+	It("should work as expected", func() {
+
+		expected := getBaseWorkerPod("unload", nmc, ptr.To("/var/lib/firmware"), true, false)
 
 		container, _ := podcmd.FindContainerByName(expected, "worker")
 		Expect(container).NotTo(BeNil())
@@ -1540,8 +1829,6 @@ var _ = Describe("podManagerImpl_CreateUnloaderPod", func() {
 
 		expected.Annotations[hashAnnotationKey] = fmt.Sprintf("%d", hash)
 
-		ctx := context.TODO()
-
 		gomock.InOrder(
 			psh.EXPECT().VolumesAndVolumeMounts(ctx, &mi),
 			caHelper.EXPECT().GetClusterCA(ctx, namespace).Return(clusterCACM, nil),
@@ -1549,7 +1836,10 @@ var _ = Describe("podManagerImpl_CreateUnloaderPod", func() {
 			client.EXPECT().Create(ctx, cmpmock.DiffEq(expected)),
 		)
 
-		pm := newPodManager(client, workerImage, scheme, caHelper, workerCfg)
+		workerCfg := *workerCfg
+		workerCfg.FirmwareHostPath = ptr.To("/var/lib/firmware")
+
+		pm := newPodManager(client, workerImage, scheme, caHelper, &workerCfg)
 		pm.(*podManagerImpl).psh = psh
 
 		Expect(
@@ -1650,7 +1940,8 @@ var _ = Describe("podManagerImpl_ListWorkerPodsOnNode", func() {
 	})
 })
 
-func getBaseWorkerPod(subcommand string, action WorkerAction, owner ctrlclient.Object, firmwareClassPath *string, withFirmware bool) *v1.Pod {
+func getBaseWorkerPod(subcommand string, owner ctrlclient.Object, firmwareHostPath *string,
+	withFirmware, isLoaderPod bool) *v1.Pod {
 	GinkgoHelper()
 
 	const (
@@ -1662,16 +1953,22 @@ func getBaseWorkerPod(subcommand string, action WorkerAction, owner ctrlclient.O
 		volNameModulesOrder   = "modules-order"
 	)
 
+	action := WorkerActionLoad
+	if !isLoaderPod {
+		action = WorkerActionUnload
+	}
+
 	hostPathFile := v1.HostPathFile
 	hostPathDirectory := v1.HostPathDirectory
 	hostPathDirectoryOrCreate := v1.HostPathDirectoryOrCreate
 
 	configAnnotationValue := `containerImage: container image
+imagePullPolicy: IfNotPresent
 inTreeModulesToRemove:
 - intree1
 - intree2
 insecurePull: true
-kernelVersion: kernel version
+kernelVersion: kernel-version
 modprobe:
   dirName: /dir
   firmwarePath: /firmware-path
@@ -1688,14 +1985,22 @@ modprobe:
 softdep b pre: c
 `
 
+	var initContainerArg = `
+mkdir -p /tmp/dir/lib/modules;
+cp -R /dir/lib/modules/kernel-version /tmp/dir/lib/modules;
+`
+
+	const initContainerArgFirmwareAddition = `
+mkdir -p /tmp/firmware-path;
+cp -R /firmware-path/* /tmp/firmware-path;
+`
+
 	args := []string{"kmod", subcommand, "/etc/kmm-worker/config.yaml"}
-	if firmwareClassPath != nil {
-		args = append(args, "--set-firmware-class-path", *firmwareClassPath)
-	}
-	if !withFirmware {
-		configAnnotationValue = strings.ReplaceAll(configAnnotationValue, "firmwarePath: /firmware-path\n  ", "")
+	if withFirmware {
+		args = append(args, "--firmware-path", *firmwareHostPath)
+		initContainerArg = strings.Join([]string{initContainerArg, initContainerArgFirmwareAddition}, "")
 	} else {
-		args = append(args, "--set-firmware-mount-path", "/var/lib/firmware")
+		configAnnotationValue = strings.ReplaceAll(configAnnotationValue, "firmwarePath: /firmware-path\n  ", "")
 	}
 	pod := v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1714,6 +2019,25 @@ softdep b pre: c
 			},
 		},
 		Spec: v1.PodSpec{
+			InitContainers: []v1.Container{
+				{
+					Name:            "image-extractor",
+					Image:           "container image",
+					ImagePullPolicy: v1.PullIfNotPresent,
+					Command:         []string{"/bin/sh", "-c"},
+					Args:            []string{initContainerArg},
+					Resources: v1.ResourceRequirements{
+						Limits:   limits,
+						Requests: requests,
+					},
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:      volNameTmp,
+							MountPath: sharedFilesDir,
+						},
+					},
+				},
+			},
 			Containers: []v1.Container{
 				{
 					Name:  "worker",
@@ -1723,6 +2047,7 @@ softdep b pre: c
 						Limits:   limits,
 						Requests: requests,
 					},
+					SecurityContext: &v1.SecurityContext{},
 					VolumeMounts: []v1.VolumeMount{
 						{
 							Name:      volNameConfig,
@@ -1753,6 +2078,11 @@ softdep b pre: c
 							Name:      globalPullSecretName,
 							ReadOnly:  true,
 							MountPath: filepath.Join(worker.PullSecretsDir, "_global", v1.DockerConfigJsonKey),
+						},
+						{
+							Name:      volNameTmp,
+							MountPath: sharedFilesDir,
+							ReadOnly:  true,
 						},
 						{
 							Name:      volNameModulesOrder,
@@ -1849,6 +2179,12 @@ softdep b pre: c
 					},
 				},
 				{
+					Name: volNameTmp,
+					VolumeSource: v1.VolumeSource{
+						EmptyDir: &v1.EmptyDirVolumeSource{},
+					},
+				},
+				{
 					Name: volNameModulesOrder,
 					VolumeSource: v1.VolumeSource{
 						DownwardAPI: &v1.DownwardAPIVolumeSource{
@@ -1866,20 +2202,16 @@ softdep b pre: c
 	}
 
 	if withFirmware {
-		hostPath := "/var/lib/firmware"
-		if firmwareClassPath != nil {
-			hostPath = *firmwareClassPath
-		}
 		fwVolMount := v1.VolumeMount{
 			Name:      volNameVarLibFirmware,
-			MountPath: "/var/lib/firmware",
+			MountPath: *firmwareHostPath,
 		}
 		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, fwVolMount)
 		fwVol := v1.Volume{
 			Name: volNameVarLibFirmware,
 			VolumeSource: v1.VolumeSource{
 				HostPath: &v1.HostPathVolumeSource{
-					Path: hostPath,
+					Path: *firmwareHostPath,
 					Type: &hostPathDirectoryOrCreate,
 				},
 			},
@@ -1988,4 +2320,230 @@ var _ = Describe("pullSecretHelperImpl_VolumesAndVolumeMounts", func() {
 		Expect(resVols).To(BeComparableTo(vols))
 		Expect(resVolMounts).To(BeComparableTo(volMounts))
 	})
+})
+
+var _ = Describe("getKernelModuleReadyLabels", func() {
+	lph := newLabelPreparationHelper()
+
+	DescribeTable("getKernelModuleReadyLabels different scenarios", func(labels map[string]string,
+		nodeModuleReadyLabelsEqual sets.Set[types.NamespacedName]) {
+		node := v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: labels,
+			},
+		}
+
+		nodeModuleReadyLabels := lph.getNodeKernelModuleReadyLabels(node)
+
+		Expect(nodeModuleReadyLabels).To(Equal(nodeModuleReadyLabelsEqual))
+	},
+		Entry("Should be empty", map[string]string{},
+			sets.Set[types.NamespacedName]{},
+		),
+
+		Entry("nodeModuleReadyLabels found", map[string]string{"invalid": ""},
+			sets.Set[types.NamespacedName]{},
+		),
+
+		Entry("nodeModuleReadyLabels found", map[string]string{fmt.Sprintf("kmm.node.kubernetes.io/%s.%s.ready", nsFirst, nameFirst): ""},
+			sets.Set[types.NamespacedName]{
+				{Namespace: nsFirst, Name: nameFirst}: {},
+			},
+		),
+	)
+})
+
+var _ = Describe("getDeprecatedKernelModuleReadyLabels", func() {
+
+	lph := newLabelPreparationHelper()
+	DescribeTable("getDeprecatedKernelModuleReadyLabels different scenarios", func(labels map[string]string,
+		deprecatedNodeModuleReadyLabelsEqual sets.Set[string]) {
+		node := v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: labels,
+			},
+		}
+
+		deprecatedNodeModuleReadyLabels := lph.getDeprecatedKernelModuleReadyLabels(node)
+
+		Expect(deprecatedNodeModuleReadyLabels).To(Equal(deprecatedNodeModuleReadyLabelsEqual))
+	},
+		Entry("Should be empty", map[string]string{},
+			sets.Set[string]{},
+		),
+
+		Entry("deprecated node module ready labels not found", map[string]string{"invalid": ""},
+			sets.Set[string]{},
+		),
+
+		Entry("deprecated node module ready labels found", map[string]string{fmt.Sprintf("kmm.node.kubernetes.io/%s.ready", nameFirst): ""},
+			sets.Set[string]{
+				fmt.Sprintf("kmm.node.kubernetes.io/%s.ready", nameFirst): {},
+			},
+		),
+	)
+})
+
+var _ = Describe("getSpecLabelsAndTheirConfigs", func() {
+
+	var (
+		nmc kmmv1beta1.NodeModulesConfig
+		lph labelPreparationHelper
+	)
+
+	BeforeEach(func() {
+		nmc = kmmv1beta1.NodeModulesConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "nmcName"},
+			Spec: kmmv1beta1.NodeModulesConfigSpec{
+				Modules: []kmmv1beta1.NodeModuleSpec{
+					{
+						ModuleItem: kmmv1beta1.ModuleItem{
+							Namespace: nsFirst,
+							Name:      nameFirst,
+						},
+						Config: kmmv1beta1.ModuleConfig{ContainerImage: imageFirst},
+					},
+				},
+			},
+		}
+		lph = newLabelPreparationHelper()
+	})
+	It("Should not have module not from nmc", func() {
+		specLabels := lph.getSpecLabelsAndTheirConfigs(&nmc)
+		Expect(specLabels).ToNot(HaveKey(types.NamespacedName{Namespace: nsSecond, Name: nameSecond}))
+	})
+
+	It("Should have module from nmc", func() {
+		specLabels := lph.getSpecLabelsAndTheirConfigs(&nmc)
+		Expect(specLabels).To(HaveKeyWithValue(types.NamespacedName{Namespace: nsFirst, Name: nameFirst}, kmmv1beta1.ModuleConfig{ContainerImage: imageFirst}))
+	})
+})
+
+var _ = Describe("getStatusLabelsAndTheirConfigs", func() {
+
+	var (
+		nmc kmmv1beta1.NodeModulesConfig
+		lph labelPreparationHelper
+	)
+
+	BeforeEach(func() {
+		nmc = kmmv1beta1.NodeModulesConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "nmcName"},
+			Status: kmmv1beta1.NodeModulesConfigStatus{
+				Modules: []kmmv1beta1.NodeModuleStatus{
+					{
+						ModuleItem: kmmv1beta1.ModuleItem{
+							Namespace: nsFirst,
+							Name:      nameFirst,
+						},
+						Config: kmmv1beta1.ModuleConfig{ContainerImage: imageFirst},
+					},
+				},
+			},
+		}
+		lph = newLabelPreparationHelper()
+	})
+	It("Should not have module not from nmc", func() {
+		statusLabels := lph.getStatusLabelsAndTheirConfigs(&nmc)
+		Expect(statusLabels).To(HaveKeyWithValue(types.NamespacedName{Namespace: nsFirst, Name: nameFirst}, kmmv1beta1.ModuleConfig{ContainerImage: imageFirst}))
+	})
+
+	It("Should have module from nmc", func() {
+		statusLabels := lph.getStatusLabelsAndTheirConfigs(&nmc)
+		Expect(statusLabels).ToNot(HaveKey(types.NamespacedName{Namespace: nsSecond, Name: nameSecond}))
+	})
+
+})
+
+var _ = Describe("removeOrphanedLabels", func() {
+
+	var lph = labelPreparationHelperImpl{}
+
+	DescribeTable("removeOrphanedLabels different scenarios", func(nodeModuleReadyLabels sets.Set[types.NamespacedName],
+		specLabels map[types.NamespacedName]kmmv1beta1.ModuleConfig,
+		statusLabels map[types.NamespacedName]kmmv1beta1.ModuleConfig,
+		node v1.Node,
+		expectedUnloaded []types.NamespacedName,
+	) {
+		unloaded := lph.removeOrphanedLabels(nodeModuleReadyLabels, specLabels, statusLabels)
+		Expect(unloaded).To(Equal(expectedUnloaded))
+	},
+		Entry("Empty spec and status labels, should result of empty unloaded variable",
+			sets.Set[types.NamespacedName]{},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{},
+			v1.Node{},
+			[]types.NamespacedName{}),
+		Entry("ModuleConfig obj exists in specLabels so it should not be in unloaded variable",
+			sets.Set[types.NamespacedName]{
+				{Namespace: nsFirst, Name: nameFirst}:   {},
+				{Namespace: nsSecond, Name: nameSecond}: {},
+			},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {}},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{},
+			v1.Node{},
+			[]types.NamespacedName{{Namespace: nsSecond, Name: nameSecond}}),
+
+		Entry("ModuleConfig obj exists in statusLabels so it should not be in unloaded variable",
+			sets.Set[types.NamespacedName]{
+				{Namespace: nsFirst, Name: nameFirst}:   {},
+				{Namespace: nsSecond, Name: nameSecond}: {},
+			},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {}},
+			v1.Node{},
+			[]types.NamespacedName{{Namespace: nsSecond, Name: nameSecond}}),
+
+		Entry("Both ModuleConfig obj exist in specLabels or statusLabels so they should not be in unloaded variable",
+			sets.Set[types.NamespacedName]{
+				{Namespace: nsFirst, Name: nameFirst}:   {},
+				{Namespace: nsSecond, Name: nameSecond}: {},
+			},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {}},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsSecond, Name: nameSecond}: {}},
+			v1.Node{},
+			[]types.NamespacedName{}))
+})
+
+var _ = Describe("addEqualLabels", func() {
+	var lph = labelPreparationHelperImpl{}
+
+	DescribeTable("addEqualLabels different scenarios", func(nodeModuleReadyLabels sets.Set[types.NamespacedName], specLabels map[types.NamespacedName]kmmv1beta1.ModuleConfig,
+		statusLabels map[types.NamespacedName]kmmv1beta1.ModuleConfig,
+		node v1.Node,
+		expectedUnloaded []types.NamespacedName,
+	) {
+		loaded := lph.addEqualLabels(nodeModuleReadyLabels, specLabels, statusLabels)
+		Expect(loaded).To(Equal(expectedUnloaded))
+	},
+		Entry("Empty spec and status labels, should result of empty loaded variable",
+			sets.Set[types.NamespacedName]{},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{},
+			v1.Node{},
+			[]types.NamespacedName{}),
+		Entry("specConfig and statusConfig are equal and nsn is not in nodeModuleReadyLabels, so nsn should be returned",
+			sets.Set[types.NamespacedName]{
+				{Namespace: nsSecond, Name: nameSecond}: {},
+			},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {ContainerImage: imageFirst}},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {ContainerImage: imageFirst}},
+			v1.Node{},
+			[]types.NamespacedName{{Namespace: nsFirst, Name: nameFirst}}),
+		Entry("specConfig and statusConfig aren't equal so nsn shouldn't not be returned",
+			sets.Set[types.NamespacedName]{
+				{Namespace: nsSecond, Name: nameSecond}: {},
+			},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {ContainerImage: imageFirst}},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {ContainerImage: imageSecond}},
+			v1.Node{},
+			[]types.NamespacedName{}),
+		Entry("nsn is in nodeModuleReadyLabels so nsn should not be returned",
+			sets.Set[types.NamespacedName]{
+				{Namespace: nsFirst, Name: nameFirst}: {},
+			},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {ContainerImage: imageFirst}},
+			map[types.NamespacedName]kmmv1beta1.ModuleConfig{{Namespace: nsFirst, Name: nameFirst}: {ContainerImage: imageFirst}},
+			v1.Node{},
+			[]types.NamespacedName{}))
 })

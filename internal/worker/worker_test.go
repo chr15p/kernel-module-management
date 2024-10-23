@@ -3,18 +3,20 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/rh-ecosystem-edge/kernel-module-management/api/v1beta1"
+	"github.com/rh-ecosystem-edge/kernel-module-management/internal/utils"
 	"go.uber.org/mock/gomock"
 )
 
 var _ = Describe("worker_LoadKmod", func() {
 	var (
-		im       *MockImageMounter
+		fh       *utils.MockFSHelper
 		mr       *MockModprobeRunner
 		w        Worker
 		imageDir string
@@ -23,9 +25,9 @@ var _ = Describe("worker_LoadKmod", func() {
 
 	BeforeEach(func() {
 		ctrl := gomock.NewController(GinkgoT())
-		im = NewMockImageMounter(ctrl)
+		fh = utils.NewMockFSHelper(ctrl)
 		mr = NewMockModprobeRunner(ctrl)
-		w = NewWorker(im, mr, GinkgoLogr)
+		w = NewWorker(mr, fh, GinkgoLogr)
 
 		var err error
 		imageDir, err = os.MkdirTemp("", "imageDir")
@@ -49,22 +51,6 @@ var _ = Describe("worker_LoadKmod", func() {
 		moduleName = "test"
 	)
 
-	It("should return an error if the image could not be pulled", func() {
-		cfg := v1beta1.ModuleConfig{
-			ContainerImage: imageName,
-		}
-		im.
-			EXPECT().
-			MountImage(ctx, imageName, &cfg).
-			Return("", errors.New("random error"))
-
-		Expect(
-			w.LoadKmod(ctx, &cfg, ""),
-		).To(
-			HaveOccurred(),
-		)
-	})
-
 	It("should return an error if modprobe failed", func() {
 		cfg := v1beta1.ModuleConfig{
 			ContainerImage: imageName,
@@ -74,10 +60,7 @@ var _ = Describe("worker_LoadKmod", func() {
 			},
 		}
 
-		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg),
-			mr.EXPECT().Run(ctx, "-vd", dirName, moduleName).Return(errors.New("random error")),
-		)
+		mr.EXPECT().Run(ctx, "-vd", filepath.Join(sharedFilesDir, dirName), moduleName).Return(errors.New("random error"))
 
 		Expect(
 			w.LoadKmod(ctx, &cfg, ""),
@@ -86,8 +69,8 @@ var _ = Describe("worker_LoadKmod", func() {
 		)
 	})
 
-	It("should remove the in-tree module if configured", func() {
-		inTreeModulesToRemove := []string{"intree1", "intree2"}
+	It("should remove present-on-host in-tree module if configured", func() {
+		inTreeModulesToRemove := []string{"intree1", "intree2", "intree3", "intree4"}
 
 		cfg := v1beta1.ModuleConfig{
 			ContainerImage:        imageName,
@@ -99,9 +82,12 @@ var _ = Describe("worker_LoadKmod", func() {
 		}
 
 		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg),
-			mr.EXPECT().Run(ctx, "-rv", "intree1", "intree2"),
-			mr.EXPECT().Run(ctx, "-vd", dirName, moduleName),
+			fh.EXPECT().FileExists("/lib/modules", "^intree1.ko").Return(true, nil),
+			fh.EXPECT().FileExists("/lib/modules", "^intree2.ko").Return(false, nil),
+			fh.EXPECT().FileExists("/lib/modules", "^intree3.ko").Return(true, nil),
+			fh.EXPECT().FileExists("/lib/modules", "^intree4.ko").Return(false, fmt.Errorf("some error")),
+			mr.EXPECT().Run(ctx, "-rv", "intree1", "intree3"),
+			mr.EXPECT().Run(ctx, "-vd", filepath.Join(sharedFilesDir, dirName), moduleName),
 		)
 
 		Expect(
@@ -123,9 +109,9 @@ var _ = Describe("worker_LoadKmod", func() {
 		}
 
 		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg),
+			fh.EXPECT().FileExists("/lib/modules", "^intreeToRemove.ko").Return(true, nil),
 			mr.EXPECT().Run(ctx, "-rv", "intreeToRemove"),
-			mr.EXPECT().Run(ctx, "-vd", dirName, moduleName),
+			mr.EXPECT().Run(ctx, "-vd", filepath.Join(sharedFilesDir, dirName), moduleName),
 		)
 
 		Expect(
@@ -145,17 +131,14 @@ var _ = Describe("worker_LoadKmod", func() {
 			},
 		}
 
-		err := os.MkdirAll(imageDir+"/"+"firmwareDir/binDir", 0750)
+		err := os.MkdirAll(filepath.Join(sharedFilesDir, "firmwareDir", "binDir"), 0750)
 		Expect(err).Should(BeNil())
-		err = os.WriteFile(imageDir+"/"+"firmwareDir/firwmwareFile1", []byte("some data 1"), 0660)
+		err = os.WriteFile(filepath.Join(sharedFilesDir, "firmwareDir", "firwmwareFile1"), []byte("some data 1"), 0660)
 		Expect(err).Should(BeNil())
-		err = os.WriteFile(imageDir+"/"+"firmwareDir/binDir/firwmwareFile2", []byte("some data 2"), 0660)
+		err = os.WriteFile(filepath.Join(sharedFilesDir, "firmwareDir", "binDir", "firwmwareFile2"), []byte("some data 2"), 0660)
 		Expect(err).Should(BeNil())
 
-		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg).Return(imageDir, nil),
-			mr.EXPECT().Run(ctx, "-vd", imageDir+dirName, moduleName),
-		)
+		mr.EXPECT().Run(ctx, "-vd", filepath.Join(sharedFilesDir, dirName), moduleName)
 
 		Expect(
 			w.LoadKmod(ctx, &cfg, hostDir),
@@ -180,10 +163,7 @@ var _ = Describe("worker_LoadKmod", func() {
 			},
 		}
 
-		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg),
-			mr.EXPECT().Run(ctx, ToInterfaceSlice(rawArgs)...),
-		)
+		mr.EXPECT().Run(ctx, ToInterfaceSlice(rawArgs)...)
 
 		Expect(
 			w.LoadKmod(ctx, &cfg, ""),
@@ -203,12 +183,7 @@ var _ = Describe("worker_LoadKmod", func() {
 			},
 		}
 
-		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg),
-			mr.
-				EXPECT().
-				Run(ctx, "-vd", dirName, "a", "b", "c", moduleName, "key0=value0", "key1=value1"),
-		)
+		mr.EXPECT().Run(ctx, "-vd", filepath.Join(sharedFilesDir, dirName), "a", "b", "c", moduleName, "key0=value0", "key1=value1")
 
 		Expect(
 			w.LoadKmod(ctx, &cfg, ""),
@@ -267,8 +242,8 @@ var _ = Describe("worker_SetFirmwareClassPath", func() {
 
 var _ = Describe("worker_UnloadKmod", func() {
 	var (
-		im       *MockImageMounter
 		mr       *MockModprobeRunner
+		fh       *utils.MockFSHelper
 		w        Worker
 		imageDir string
 		hostDir  string
@@ -276,9 +251,9 @@ var _ = Describe("worker_UnloadKmod", func() {
 
 	BeforeEach(func() {
 		ctrl := gomock.NewController(GinkgoT())
-		im = NewMockImageMounter(ctrl)
 		mr = NewMockModprobeRunner(ctrl)
-		w = NewWorker(im, mr, GinkgoLogr)
+		fh = utils.NewMockFSHelper(ctrl)
+		w = NewWorker(mr, fh, GinkgoLogr)
 		var err error
 		imageDir, err = os.MkdirTemp("", "imageDir")
 		Expect(err).Should(BeNil())
@@ -301,23 +276,6 @@ var _ = Describe("worker_UnloadKmod", func() {
 		moduleName = "test"
 	)
 
-	It("should return an error if the image could not be pulled", func() {
-		cfg := v1beta1.ModuleConfig{
-			ContainerImage: imageName,
-		}
-
-		im.
-			EXPECT().
-			MountImage(ctx, imageName, &cfg).
-			Return("", errors.New("random error"))
-
-		Expect(
-			w.UnloadKmod(ctx, &cfg, ""),
-		).To(
-			HaveOccurred(),
-		)
-	})
-
 	It("should return an error if modprobe failed", func() {
 		cfg := v1beta1.ModuleConfig{
 			ContainerImage: imageName,
@@ -327,10 +285,7 @@ var _ = Describe("worker_UnloadKmod", func() {
 			},
 		}
 
-		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg),
-			mr.EXPECT().Run(ctx, "-rvd", dirName, moduleName).Return(errors.New("random error")),
-		)
+		mr.EXPECT().Run(ctx, "-rvd", filepath.Join(sharedFilesDir, dirName), moduleName).Return(errors.New("random error"))
 
 		Expect(
 			w.UnloadKmod(ctx, &cfg, ""),
@@ -349,10 +304,7 @@ var _ = Describe("worker_UnloadKmod", func() {
 			},
 		}
 
-		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg),
-			mr.EXPECT().Run(ctx, ToInterfaceSlice(rawArgs)...),
-		)
+		mr.EXPECT().Run(ctx, ToInterfaceSlice(rawArgs)...)
 
 		Expect(
 			w.UnloadKmod(ctx, &cfg, ""),
@@ -371,12 +323,7 @@ var _ = Describe("worker_UnloadKmod", func() {
 			},
 		}
 
-		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg),
-			mr.
-				EXPECT().
-				Run(ctx, "-rvd", dirName, "a", "b", "c", moduleName),
-		)
+		mr.EXPECT().Run(ctx, "-rvd", filepath.Join(sharedFilesDir, dirName), "a", "b", "c", moduleName)
 
 		Expect(
 			w.UnloadKmod(ctx, &cfg, ""),
@@ -395,42 +342,14 @@ var _ = Describe("worker_UnloadKmod", func() {
 			},
 		}
 
-		// prepare the image firmware directories + files
-		err := os.MkdirAll(imageDir+"/"+"firmwareDir/binDir", 0750)
-		Expect(err).Should(BeNil())
-		err = os.WriteFile(imageDir+"/"+"firmwareDir/firmwareFile1", []byte("some data 1"), 0660)
-		Expect(err).Should(BeNil())
-		err = os.WriteFile(imageDir+"/"+"firmwareDir/binDir/firmwareFile2", []byte("some data 2"), 0660)
-		Expect(err).Should(BeNil())
-
-		// prepare the mapped host firmware directories + files
-		err = os.MkdirAll(hostDir+"/binDir", 0750)
-		Expect(err).Should(BeNil())
-		err = os.WriteFile(hostDir+"/firmwareFile1", []byte("some data 1"), 0660)
-		Expect(err).Should(BeNil())
-		err = os.WriteFile(hostDir+"/binDir/firmwareFile2", []byte("some data 2"), 0660)
-		Expect(err).Should(BeNil())
-
-		gomock.InOrder(
-			im.EXPECT().MountImage(ctx, imageName, &cfg).Return(imageDir, nil),
-			mr.
-				EXPECT().
-				Run(ctx, "-rvd", imageDir+dirName, moduleName),
-		)
+		mr.EXPECT().Run(ctx, "-rvd", filepath.Join(sharedFilesDir, dirName), moduleName)
+		fh.EXPECT().RemoveSrcFilesFromDst(filepath.Join(sharedFilesDir, cfg.Modprobe.FirmwarePath), hostDir).Return(nil)
 
 		Expect(
 			w.UnloadKmod(ctx, &cfg, hostDir),
 		).NotTo(
 			HaveOccurred(),
 		)
-
-		// check only the files deletion
-		_, err = os.Stat(hostDir + "/binDir")
-		Expect(err).Should(BeNil())
-		_, err = os.Stat(hostDir + "/binDir/firwmwareFile2")
-		Expect(err).NotTo(BeNil())
-		_, err = os.Stat(hostDir + "/firwmwareFile1")
-		Expect(err).NotTo(BeNil())
 	})
 })
 

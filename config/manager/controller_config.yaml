@@ -13,3 +13,4 @@ metrics:
 worker:
   runAsUser: 0
   seLinuxType: spc_t
+  firmwareHostPath: /var/lib/firmware

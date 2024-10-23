@@ -19,23 +19,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/rh-ecosystem-edge/kernel-module-management/internal/node"
 	"os"
 	"strconv"
-
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/klog/v2/textlogger"
-	clusterv1alpha1 "open-cluster-management.io/api/cluster/v1alpha1"
-	ctrl "sigs.k8s.io/controller-runtime"
-	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
-
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	buildv1 "github.com/openshift/api/build/v1"
 	imagev1 "github.com/openshift/api/image/v1"
@@ -59,6 +45,21 @@ import (
 	signocpbuild "github.com/rh-ecosystem-edge/kernel-module-management/internal/sign/ocpbuild"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/syncronizedmap"
 	ocpbuildutils "github.com/rh-ecosystem-edge/kernel-module-management/internal/utils/ocpbuild"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/klog/v2/textlogger"
+	clusterv1alpha1 "open-cluster-management.io/api/cluster/v1alpha1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+
+	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
+	// to ensure that exec-entrypoint and run can make use of them.
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -129,6 +130,7 @@ func main() {
 	metricsAPI := metrics.New()
 	metricsAPI.Register()
 	buildHelperAPI := build.NewHelper()
+	nodeAPI := node.NewNode(client)
 	registryAPI := registry.NewRegistry()
 	authFactory := auth.NewRegistryAuthGetterFactory(
 		client,
@@ -137,42 +139,17 @@ func main() {
 		),
 	)
 
-	buildAPI := buildocpbuild.NewManager(
-		client,
-		buildocpbuild.NewMaker(client, buildHelperAPI, scheme, kernelOsDtkMapping),
-		ocpbuildutils.NewOCPBuildsHelper(client, buildocpbuild.BuildType),
-		authFactory,
-		registryAPI,
-	)
-
-	signAPI := signocpbuild.NewManager(
-		client,
-		signocpbuild.NewMaker(client, cmd.GetEnvOrFatalError("RELATED_IMAGE_SIGN", setupLogger), scheme),
-		ocpbuildutils.NewOCPBuildsHelper(client, signocpbuild.BuildType),
-		authFactory,
-		registryAPI,
-	)
-
 	kernelAPI := module.NewKernelMapper(buildHelperAPI, sign.NewSignerHelper())
 
 	dpc := controllers.NewDevicePluginReconciler(
 		client,
 		metricsAPI,
 		filterAPI,
+		nodeAPI,
 		scheme,
 		operatorNamespace)
 	if err = dpc.SetupWithManager(mgr); err != nil {
 		cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.DevicePluginReconcilerName)
-	}
-
-	bsc := controllers.NewBuildSignReconciler(
-		client,
-		buildAPI,
-		signAPI,
-		kernelAPI,
-		filterAPI)
-	if err = bsc.SetupWithManager(mgr, constants.KernelLabel); err != nil {
-		cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.BuildSignReconcilerName)
 	}
 
 	caHelper := ca.NewHelper(client, scheme)
@@ -187,11 +164,12 @@ func main() {
 		registryAPI,
 		nmcHelper,
 		filterAPI,
+		nodeAPI,
 		authFactory,
 		operatorNamespace,
 		scheme,
 	)
-	if err = mnc.SetupWithManager(mgr); err != nil {
+	if err = mnc.SetupWithManager(mgr, !managed); err != nil {
 		cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.ModuleNMCReconcilerName)
 	}
 
@@ -199,7 +177,7 @@ func main() {
 
 	eventRecorder := mgr.GetEventRecorderFor("kmm")
 
-	if err = controllers.NewNMCReconciler(client, scheme, workerImage, caHelper, &cfg.Worker, eventRecorder).SetupWithManager(ctx, mgr); err != nil {
+	if err = controllers.NewNMCReconciler(client, scheme, workerImage, caHelper, &cfg.Worker, eventRecorder, nodeAPI).SetupWithManager(ctx, mgr); err != nil {
 		cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.NodeModulesConfigReconcilerName)
 	}
 
@@ -217,14 +195,6 @@ func main() {
 		cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.NodeLabelModuleVersionReconcilerName)
 	}
 
-	preflightStatusUpdaterAPI := preflight.NewStatusUpdater(client)
-	preflightOCPStatusUpdaterAPI := preflight.NewOCPStatusUpdater(client)
-	preflightAPI := preflight.NewPreflightAPI(client, buildAPI, signAPI, registryAPI, kernelAPI, preflightStatusUpdaterAPI, authFactory)
-
-	if err = controllers.NewPreflightValidationReconciler(client, filterAPI, metricsAPI, preflightStatusUpdaterAPI, preflightAPI).SetupWithManager(mgr); err != nil {
-		cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.PreflightValidationReconcilerName)
-	}
-
 	if managed {
 		setupLogger.Info("Starting as managed")
 
@@ -236,6 +206,32 @@ func main() {
 			cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.NodeKernelClusterClaimReconcilerName)
 		}
 	} else {
+		buildAPI := buildocpbuild.NewManager(
+			client,
+			buildocpbuild.NewMaker(client, buildHelperAPI, scheme, kernelOsDtkMapping),
+			ocpbuildutils.NewOCPBuildsHelper(client, buildocpbuild.BuildType),
+			authFactory,
+			registryAPI,
+		)
+
+		signAPI := signocpbuild.NewManager(
+			client,
+			signocpbuild.NewMaker(client, cmd.GetEnvOrFatalError("RELATED_IMAGE_SIGN", setupLogger), scheme),
+			ocpbuildutils.NewOCPBuildsHelper(client, signocpbuild.BuildType),
+			authFactory,
+			registryAPI,
+		)
+		bsc := controllers.NewBuildSignReconciler(
+			client,
+			buildAPI,
+			signAPI,
+			kernelAPI,
+			filterAPI,
+			nodeAPI)
+		if err = bsc.SetupWithManager(mgr, constants.KernelLabel); err != nil {
+			cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.BuildSignReconcilerName)
+		}
+
 		helper := controllers.NewJobEventReconcilerHelper(client)
 
 		if err = controllers.NewBuildSignEventsReconciler(client, helper, eventRecorder).SetupWithManager(mgr); err != nil {
@@ -244,6 +240,25 @@ func main() {
 
 		if err = controllers.NewJobGCReconciler(client, cfg.Job.GCDelay).SetupWithManager(mgr); err != nil {
 			cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.JobGCReconcilerName)
+		}
+
+		preflightStatusUpdaterAPI := preflight.NewStatusUpdater(client)
+		preflightAPI := preflight.NewPreflightAPI(client, buildAPI, signAPI, registryAPI, kernelAPI, preflightStatusUpdaterAPI, authFactory)
+
+		if err = controllers.NewPreflightValidationReconciler(client, filterAPI, metricsAPI, preflightStatusUpdaterAPI, preflightAPI).SetupWithManager(mgr); err != nil {
+			cmd.FatalError(setupLogger, err, "unable to create controller", "name", controllers.PreflightValidationReconcilerName)
+		}
+
+		preflightOCPStatusUpdaterAPI := preflight.NewOCPStatusUpdater(client)
+
+		if err = controllers.NewPreflightValidationOCPReconciler(client,
+			filterAPI,
+			registryAPI,
+			authFactory,
+			kernelOsDtkMapping,
+			preflightOCPStatusUpdaterAPI,
+			scheme).SetupWithManager(mgr); err != nil {
+			cmd.FatalError(setupLogger, err, "unable to create controller", "controller", controllers.PreflightValidationOCPReconcilerName)
 		}
 	}
 
@@ -255,19 +270,7 @@ func main() {
 	dtkClient := ctrlclient.NewNamespacedClient(client, constants.DTKImageStreamNamespace)
 
 	if err = controllers.NewImageStreamReconciler(dtkClient, kernelOsDtkMapping, dtkNSN).SetupWithManager(mgr, filterAPI); err != nil {
-		setupLogger.Error(err, "unable to create controller", "controller", "ImageStream")
-		os.Exit(1)
-	}
-
-	if err = controllers.NewPreflightValidationOCPReconciler(client,
-		filterAPI,
-		registryAPI,
-		authFactory,
-		kernelOsDtkMapping,
-		preflightOCPStatusUpdaterAPI,
-		scheme).SetupWithManager(mgr); err != nil {
-		setupLogger.Error(err, "unable to create controller", "controller", "PreflightOCP")
-		os.Exit(1)
+		cmd.FatalError(setupLogger, err, "unable to create controller", "controller", controllers.ImageStreamReconcilerName)
 	}
 
 	//+kubebuilder:scaffold:builder

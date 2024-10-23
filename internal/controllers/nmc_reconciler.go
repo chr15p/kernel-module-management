@@ -15,6 +15,7 @@ import (
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/filter"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/meta"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/nmc"
+	"github.com/rh-ecosystem-edge/kernel-module-management/internal/node"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/ocp/ca"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/utils"
 	"github.com/rh-ecosystem-edge/kernel-module-management/internal/worker"
@@ -54,6 +55,9 @@ const (
 	volumeNameConfig           = "config"
 	workerContainerName        = "worker"
 	globalPullSecretName       = "global-pull-secret"
+	initContainerName          = "image-extractor"
+	sharedFilesDir             = "/tmp"
+	volNameTmp                 = "tmp"
 )
 
 //+kubebuilder:rbac:groups=kmm.sigs.x-k8s.io,resources=nodemodulesconfigs,verbs=get;list;watch
@@ -66,8 +70,9 @@ const (
 //+kubebuilder:rbac:groups="core",resources=serviceaccounts,verbs=get;list;watch
 
 type NMCReconciler struct {
-	client client.Client
-	helper nmcReconcilerHelper
+	client  client.Client
+	helper  nmcReconcilerHelper
+	nodeAPI node.Node
 }
 
 func NewNMCReconciler(
@@ -77,12 +82,14 @@ func NewNMCReconciler(
 	caHelper ca.Helper,
 	workerCfg *config.Worker,
 	recorder record.EventRecorder,
+	nodeAPI node.Node,
 ) *NMCReconciler {
 	pm := newPodManager(client, workerImage, scheme, caHelper, workerCfg)
-	helper := newNMCReconcilerHelper(client, pm, recorder)
+	helper := newNMCReconcilerHelper(client, pm, recorder, nodeAPI)
 	return &NMCReconciler{
-		client: client,
-		helper: helper,
+		client:  client,
+		helper:  helper,
+		nodeAPI: nodeAPI,
 	}
 }
 
@@ -120,6 +127,16 @@ func (r *NMCReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 		statusMap[status.Namespace+"/"+status.Name] = &nmcObj.Status.Modules[i]
 	}
 
+	node := v1.Node{}
+	if err := r.client.Get(ctx, types.NamespacedName{Name: nmcObj.Name}, &node); err != nil {
+		return ctrl.Result{}, fmt.Errorf("could not get node %s: %v", nmcObj.Name, err)
+	}
+
+	// skipping handling NMC spec, labelling, events until node becomes ready
+	if !r.nodeAPI.IsNodeSchedulable(&node) {
+		return ctrl.Result{}, nil
+	}
+
 	errs := make([]error, 0, len(nmcObj.Spec.Modules)+len(nmcObj.Status.Modules))
 
 	for _, mod := range nmcObj.Spec.Modules {
@@ -127,7 +144,7 @@ func (r *NMCReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 
 		logger := logger.WithValues("module", moduleNameKey)
 
-		if err := r.helper.ProcessModuleSpec(ctrl.LoggerInto(ctx, logger), &nmcObj, &mod, statusMap[moduleNameKey]); err != nil {
+		if err := r.helper.ProcessModuleSpec(ctrl.LoggerInto(ctx, logger), &nmcObj, &mod, statusMap[moduleNameKey], &node); err != nil {
 			errs = append(
 				errs,
 				fmt.Errorf("error processing Module %s: %v", moduleNameKey, err),
@@ -145,10 +162,10 @@ func (r *NMCReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 	for statusNameKey, status := range statusMap {
 		logger := logger.WithValues("status", statusNameKey)
 
-		if err := r.helper.ProcessUnconfiguredModuleStatus(ctrl.LoggerInto(ctx, logger), &nmcObj, status); err != nil {
+		if err := r.helper.ProcessUnconfiguredModuleStatus(ctrl.LoggerInto(ctx, logger), &nmcObj, status, &node); err != nil {
 			errs = append(
 				errs,
-				fmt.Errorf("erorr processing orphan status for Module %s: %v", statusNameKey, err),
+				fmt.Errorf("error processing orphan status for Module %s: %v", statusNameKey, err),
 			)
 		}
 	}
@@ -157,8 +174,10 @@ func (r *NMCReconciler) Reconcile(ctx context.Context, req reconcile.Request) (r
 		errs = append(errs, fmt.Errorf("failed to GC in-use labels for NMC %s: %v", req.NamespacedName, err))
 	}
 
-	if err := r.helper.UpdateNodeLabelsAndRecordEvents(ctx, &nmcObj); err != nil {
+	if loaded, unloaded, err := r.helper.UpdateNodeLabels(ctx, &nmcObj, &node); err != nil {
 		errs = append(errs, fmt.Errorf("could not update node's labels for NMC %s: %v", req.NamespacedName, err))
+	} else {
+		r.helper.RecordEvents(&node, loaded, unloaded)
 	}
 
 	return ctrl.Result{}, errors.Join(errs...)
@@ -208,40 +227,33 @@ func GetContainerStatus(statuses []v1.ContainerStatus, name string) v1.Container
 	return v1.ContainerStatus{}
 }
 
-func FindNodeCondition(cond []v1.NodeCondition, conditionType v1.NodeConditionType) *v1.NodeCondition {
-	for i := 0; i < len(cond); i++ {
-		c := cond[i]
-
-		if c.Type == conditionType {
-			return &c
-		}
-	}
-
-	return nil
-}
-
 //go:generate mockgen -source=nmc_reconciler.go -package=controllers -destination=mock_nmc_reconciler.go workerHelper
 
 type nmcReconcilerHelper interface {
 	GarbageCollectInUseLabels(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig) error
-	ProcessModuleSpec(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig, spec *kmmv1beta1.NodeModuleSpec, status *kmmv1beta1.NodeModuleStatus) error
-	ProcessUnconfiguredModuleStatus(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig, status *kmmv1beta1.NodeModuleStatus) error
+	ProcessModuleSpec(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig, spec *kmmv1beta1.NodeModuleSpec, status *kmmv1beta1.NodeModuleStatus, node *v1.Node) error
+	ProcessUnconfiguredModuleStatus(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig, status *kmmv1beta1.NodeModuleStatus, node *v1.Node) error
 	RemovePodFinalizers(ctx context.Context, nodeName string) error
 	SyncStatus(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig) error
-	UpdateNodeLabelsAndRecordEvents(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig) error
+	UpdateNodeLabels(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig, node *v1.Node) ([]types.NamespacedName, []types.NamespacedName, error)
+	RecordEvents(node *v1.Node, loadedModules, unloadedModules []types.NamespacedName)
 }
 
 type nmcReconcilerHelperImpl struct {
 	client   client.Client
 	pm       podManager
 	recorder record.EventRecorder
+	nodeAPI  node.Node
+	lph      labelPreparationHelper
 }
 
-func newNMCReconcilerHelper(client client.Client, pm podManager, recorder record.EventRecorder) nmcReconcilerHelper {
+func newNMCReconcilerHelper(client client.Client, pm podManager, recorder record.EventRecorder, nodeAPI node.Node) nmcReconcilerHelper {
 	return &nmcReconcilerHelperImpl{
 		client:   client,
 		pm:       pm,
 		recorder: recorder,
+		nodeAPI:  nodeAPI,
+		lph:      newLabelPreparationHelper(),
 	}
 }
 
@@ -310,6 +322,7 @@ func (h *nmcReconcilerHelperImpl) ProcessModuleSpec(
 	nmcObj *kmmv1beta1.NodeModulesConfig,
 	spec *kmmv1beta1.NodeModuleSpec,
 	status *kmmv1beta1.NodeModuleStatus,
+	node *v1.Node,
 ) error {
 	podName := workerPodName(nmcObj.Name, spec.Name)
 
@@ -321,30 +334,27 @@ func (h *nmcReconcilerHelperImpl) ProcessModuleSpec(
 	}
 
 	if pod == nil {
+		// new module is introduced, need to load it
 		if status == nil {
 			logger.Info("Missing status; creating loader Pod")
 			return h.pm.CreateLoaderPod(ctx, nmcObj, spec)
 		}
 
+		/* configuration changed for module: if spec status contain the same kernel,
+		unload the kernel module, otherwise - load kernel modules, since the pod
+		is not running, the module cannot be loaded using the old kernel configuration
+		*/
 		if !reflect.DeepEqual(spec.Config, status.Config) {
-			logger.Info("Outdated config in status; creating unloader Pod")
-			return h.pm.CreateUnloaderPod(ctx, nmcObj, status)
+			if spec.Config.KernelVersion == status.Config.KernelVersion {
+				logger.Info("Outdated config in status; creating unloader Pod")
+				return h.pm.CreateUnloaderPod(ctx, nmcObj, status)
+			}
+			logger.Info("Outdated config in status and kernels differ, probably due to upgrade; creating loader Pod")
+			return h.pm.CreateLoaderPod(ctx, nmcObj, spec)
 		}
 
-		node := v1.Node{}
-
-		if err = h.client.Get(ctx, types.NamespacedName{Name: nmcObj.Name}, &node); err != nil {
-			return fmt.Errorf("could not get node %s: %v", nmcObj.Name, err)
-		}
-
-		readyCondition := FindNodeCondition(node.Status.Conditions, v1.NodeReady)
-		if readyCondition == nil {
-			return fmt.Errorf("node %s has no Ready condition", nmcObj.Name)
-		}
-
-		if readyCondition.Status == v1.ConditionTrue && status.LastTransitionTime.Before(&readyCondition.LastTransitionTime) {
-			logger.Info("Outdated last transition time status; creating loader Pod")
-
+		if h.nodeAPI.NodeBecomeReadyAfter(node, status.LastTransitionTime) {
+			logger.Info("node has been rebooted and become ready after kernel module was loaded; creating loader Pod")
 			return h.pm.CreateLoaderPod(ctx, nmcObj, spec)
 		}
 
@@ -385,10 +395,19 @@ func (h *nmcReconcilerHelperImpl) ProcessUnconfiguredModuleStatus(
 	ctx context.Context,
 	nmcObj *kmmv1beta1.NodeModulesConfig,
 	status *kmmv1beta1.NodeModuleStatus,
+	node *v1.Node,
 ) error {
 	podName := workerPodName(nmcObj.Name, status.Name)
 
 	logger := ctrl.LoggerFrom(ctx).WithValues("pod name", podName)
+
+	/* node was rebooted, spec not set so no kernel module is loaded, no need to unload.
+	   it also fixes the scenario when node's kernel was upgraded, so unload pod will fail anyway
+	*/
+	if h.nodeAPI.NodeBecomeReadyAfter(node, status.LastTransitionTime) {
+		logger.Info("node was rebooted, no need to unload kernel module that is not present in kernel, will wait until NMC spec is updated")
+		return nil
+	}
 
 	pod, err := h.pm.GetWorkerPod(ctx, podName, status.Namespace)
 	if err != nil {
@@ -566,95 +585,102 @@ func (h *nmcReconcilerHelperImpl) SyncStatus(ctx context.Context, nmcObj *kmmv1b
 	return errors.Join(errs...)
 }
 
-func (h *nmcReconcilerHelperImpl) UpdateNodeLabelsAndRecordEvents(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig) error {
-	node := v1.Node{}
-	if err := h.client.Get(ctx, types.NamespacedName{Name: nmc.Name}, &node); err != nil {
-		return fmt.Errorf("could not get node %s: %v", nmc.Name, err)
-	}
+type labelPreparationHelper interface {
+	getDeprecatedKernelModuleReadyLabels(node v1.Node) sets.Set[string]
+	getNodeKernelModuleReadyLabels(node v1.Node) sets.Set[types.NamespacedName]
+	getSpecLabelsAndTheirConfigs(nmc *kmmv1beta1.NodeModulesConfig) map[types.NamespacedName]kmmv1beta1.ModuleConfig
+	getStatusLabelsAndTheirConfigs(nmc *kmmv1beta1.NodeModulesConfig) map[types.NamespacedName]kmmv1beta1.ModuleConfig
+	addEqualLabels(nodeModuleReadyLabels sets.Set[types.NamespacedName],
+		specLabels, statusLabels map[types.NamespacedName]kmmv1beta1.ModuleConfig) []types.NamespacedName
+	removeOrphanedLabels(nodeModuleReadyLabels sets.Set[types.NamespacedName],
+		specLabels, statusLabels map[types.NamespacedName]kmmv1beta1.ModuleConfig) []types.NamespacedName
+}
+type labelPreparationHelperImpl struct{}
 
-	// get all the kernel module ready labels of the node
+func newLabelPreparationHelper() labelPreparationHelper {
+	return &labelPreparationHelperImpl{}
+}
+
+func (lph *labelPreparationHelperImpl) getNodeKernelModuleReadyLabels(node v1.Node) sets.Set[types.NamespacedName] {
 	nodeModuleReadyLabels := sets.New[types.NamespacedName]()
-	deprecatedNodeModuleReadyLabels := sets.New[string]()
 
 	for label := range node.GetLabels() {
 		if ok, namespace, name := utils.IsKernelModuleReadyNodeLabel(label); ok {
 			nodeModuleReadyLabels.Insert(types.NamespacedName{Namespace: namespace, Name: name})
 		}
+	}
+	return nodeModuleReadyLabels
+}
 
+func (lph *labelPreparationHelperImpl) getDeprecatedKernelModuleReadyLabels(node v1.Node) sets.Set[string] {
+	deprecatedNodeModuleReadyLabels := sets.New[string]()
+
+	for label := range node.GetLabels() {
 		if utils.IsDeprecatedKernelModuleReadyNodeLabel(label) {
 			deprecatedNodeModuleReadyLabels.Insert(label)
 		}
 	}
+	return deprecatedNodeModuleReadyLabels
+}
 
-	// get spec labels and their config
+func (lph *labelPreparationHelperImpl) getSpecLabelsAndTheirConfigs(nmc *kmmv1beta1.NodeModulesConfig) map[types.NamespacedName]kmmv1beta1.ModuleConfig {
 	specLabels := make(map[types.NamespacedName]kmmv1beta1.ModuleConfig)
+
 	for _, module := range nmc.Spec.Modules {
 		specLabels[types.NamespacedName{Namespace: module.Namespace, Name: module.Name}] = module.Config
 	}
+	return specLabels
+}
 
-	// get status labels and their config
+func (lph *labelPreparationHelperImpl) getStatusLabelsAndTheirConfigs(nmc *kmmv1beta1.NodeModulesConfig) map[types.NamespacedName]kmmv1beta1.ModuleConfig {
 	statusLabels := make(map[types.NamespacedName]kmmv1beta1.ModuleConfig)
+
 	for _, module := range nmc.Status.Modules {
 		label := types.NamespacedName{Namespace: module.Namespace, Name: module.Name}
 		statusLabels[label] = module.Config
 	}
+	return statusLabels
+}
 
-	unloaded := make([]types.NamespacedName, 0, len(nodeModuleReadyLabels))
-	loaded := make([]types.NamespacedName, 0, len(specLabels))
+func (h *nmcReconcilerHelperImpl) UpdateNodeLabels(ctx context.Context, nmc *kmmv1beta1.NodeModulesConfig, node *v1.Node) ([]types.NamespacedName, []types.NamespacedName, error) {
 
-	patchFrom := client.MergeFrom(node.DeepCopy())
+	// get all the kernel module ready labels of the node
+	nodeModuleReadyLabels := h.lph.getNodeKernelModuleReadyLabels(*node)
+	deprecatedNodeModuleReadyLabels := h.lph.getDeprecatedKernelModuleReadyLabels(*node)
+
+	// get spec labels and their config
+	specLabels := h.lph.getSpecLabelsAndTheirConfigs(nmc)
+
+	// get status labels and their config
+	statusLabels := h.lph.getStatusLabelsAndTheirConfigs(nmc)
 
 	// label in node but not in spec or status - should be removed
-	for nsn := range nodeModuleReadyLabels {
-		_, inSpec := specLabels[nsn]
-		_, inStatus := statusLabels[nsn]
-		if !inSpec && !inStatus {
-			meta.RemoveLabel(
-				&node,
-				utils.GetKernelModuleReadyNodeLabel(nsn.Namespace, nsn.Name),
-			)
-
-			unloaded = append(unloaded, nsn)
-		}
-	}
-
-	// v1 ready labels, deprecated - should be removed
-	for label := range deprecatedNodeModuleReadyLabels {
-		meta.RemoveLabel(&node, label)
-	}
+	nsnLabelsToBeRemoved := h.lph.removeOrphanedLabels(nodeModuleReadyLabels, specLabels, statusLabels)
 
 	// label in spec and status and config equal - should be added
-	for nsn, specConfig := range specLabels {
-		statusConfig, ok := statusLabels[nsn]
-		if ok && reflect.DeepEqual(specConfig, statusConfig) && !nodeModuleReadyLabels.Has(nsn) {
-			meta.SetLabel(
-				&node,
-				utils.GetKernelModuleReadyNodeLabel(nsn.Namespace, nsn.Name),
-				"",
-			)
+	nsnLabelsToBeLoaded := h.lph.addEqualLabels(nodeModuleReadyLabels, specLabels, statusLabels)
 
-			loaded = append(loaded, nsn)
-		}
+	var loadedLabels []string
+	unloadedLabels := deprecatedNodeModuleReadyLabels.UnsortedList()
+
+	for _, label := range nsnLabelsToBeRemoved {
+		unloadedLabels = append(unloadedLabels, utils.GetKernelModuleReadyNodeLabel(label.Namespace, label.Name))
+	}
+	for _, label := range nsnLabelsToBeLoaded {
+		loadedLabels = append(loadedLabels, utils.GetKernelModuleReadyNodeLabel(label.Namespace, label.Name))
 	}
 
-	if err := h.client.Patch(ctx, &node, patchFrom); err != nil {
-		return fmt.Errorf("could not patch node: %v", err)
+	if err := h.nodeAPI.UpdateLabels(ctx, node, loadedLabels, unloadedLabels); err != nil {
+		return nil, nil, fmt.Errorf("could not update labels on the node: %v", err)
 	}
 
-	for _, nsn := range unloaded {
+	return nsnLabelsToBeLoaded, nsnLabelsToBeRemoved, nil
+}
+
+func (h *nmcReconcilerHelperImpl) RecordEvents(node *v1.Node, loadedModules, unloadedModules []types.NamespacedName) {
+	for _, nsn := range loadedModules {
 		h.recorder.AnnotatedEventf(
-			&node,
-			map[string]string{"module": nsn.String()},
-			v1.EventTypeNormal,
-			"ModuleUnloaded",
-			"Module %s unloaded from the kernel",
-			nsn.String(),
-		)
-	}
-
-	for _, nsn := range loaded {
-		h.recorder.AnnotatedEventf(
-			&node,
+			node,
 			map[string]string{"module": nsn.String()},
 			v1.EventTypeNormal,
 			"ModuleLoaded",
@@ -662,8 +688,44 @@ func (h *nmcReconcilerHelperImpl) UpdateNodeLabelsAndRecordEvents(ctx context.Co
 			nsn.String(),
 		)
 	}
+	for _, nsn := range unloadedModules {
+		h.recorder.AnnotatedEventf(
+			node,
+			map[string]string{"module": nsn.String()},
+			v1.EventTypeNormal,
+			"ModuleUnloaded",
+			"Module %s unloaded from the kernel",
+			nsn.String(),
+		)
+	}
+}
 
-	return nil
+func (lph *labelPreparationHelperImpl) removeOrphanedLabels(nodeModuleReadyLabels sets.Set[types.NamespacedName],
+	specLabels, statusLabels map[types.NamespacedName]kmmv1beta1.ModuleConfig) []types.NamespacedName {
+
+	unloaded := make([]types.NamespacedName, 0, len(nodeModuleReadyLabels))
+
+	for nsn := range nodeModuleReadyLabels {
+		_, inSpec := specLabels[nsn]
+		_, inStatus := statusLabels[nsn]
+		if !inSpec && !inStatus {
+			unloaded = append(unloaded, nsn)
+		}
+	}
+	return unloaded
+}
+func (lph *labelPreparationHelperImpl) addEqualLabels(nodeModuleReadyLabels sets.Set[types.NamespacedName],
+	specLabels, statusLabels map[types.NamespacedName]kmmv1beta1.ModuleConfig) []types.NamespacedName {
+
+	loaded := make([]types.NamespacedName, 0, len(nodeModuleReadyLabels))
+
+	for nsn, specConfig := range specLabels {
+		statusConfig, ok := statusLabels[nsn]
+		if ok && reflect.DeepEqual(specConfig, statusConfig) && !nodeModuleReadyLabels.Has(nsn) {
+			loaded = append(loaded, nsn)
+		}
+	}
+	return loaded
 }
 
 const (
@@ -790,17 +852,39 @@ func (p *podManagerImpl) ListWorkerPodsOnNode(ctx context.Context, nodeName stri
 }
 
 func (p *podManagerImpl) LoaderPodTemplate(ctx context.Context, nmc client.Object, nms *kmmv1beta1.NodeModuleSpec) (*v1.Pod, error) {
-	pod, err := p.baseWorkerPod(ctx, nmc.GetName(), &nms.ModuleItem, nmc)
+	pod, err := p.baseWorkerPod(ctx, nmc, &nms.ModuleItem, &nms.Config)
 	if err != nil {
 		return nil, fmt.Errorf("could not create the base Pod: %v", err)
+	}
+
+	if nms.Config.Modprobe.ModulesLoadingOrder != nil {
+		if err = setWorkerSofdepConfig(pod, nms.Config.Modprobe.ModulesLoadingOrder); err != nil {
+			return nil, fmt.Errorf("could not set software dependency for mulitple modules: %v", err)
+		}
 	}
 
 	args := []string{"kmod", "load", configFullPath}
 
 	privileged := false
+	if nms.Config.Modprobe.FirmwarePath != "" {
 
-	if p.workerCfg.SetFirmwareClassPath != nil {
-		args = append(args, "--"+worker.FlagFirmwareClassPath, *p.workerCfg.SetFirmwareClassPath)
+		firmwareHostPath := p.workerCfg.FirmwareHostPath
+		if firmwareHostPath == nil {
+			return nil, fmt.Errorf("firmwareHostPath wasn't set, while the Module requires firmware loading")
+		}
+
+		args = append(args, "--"+worker.FlagFirmwarePath, *firmwareHostPath)
+
+		firmwarePathContainerImg := filepath.Join(nms.Config.Modprobe.FirmwarePath, "*")
+		firmwarePathWorkerImg := filepath.Join(sharedFilesDir, nms.Config.Modprobe.FirmwarePath)
+		if err = addCopyCommand(pod, firmwarePathContainerImg, firmwarePathWorkerImg); err != nil {
+			return nil, fmt.Errorf("could not add the copy command to the init container: %v", err)
+		}
+
+		if err = setFirmwareVolume(pod, firmwareHostPath); err != nil {
+			return nil, fmt.Errorf("could not map host volume needed for firmware loading: %v", err)
+		}
+
 		privileged = true
 	}
 
@@ -810,19 +894,6 @@ func (p *podManagerImpl) LoaderPodTemplate(ctx context.Context, nmc client.Objec
 
 	if err = setWorkerSecurityContext(pod, p.workerCfg, privileged); err != nil {
 		return nil, fmt.Errorf("could not set the worker Pod as privileged: %v", err)
-	}
-
-	if nms.Config.Modprobe.ModulesLoadingOrder != nil {
-		if err = setWorkerSofdepConfig(pod, nms.Config.Modprobe.ModulesLoadingOrder); err != nil {
-			return nil, fmt.Errorf("could not set software dependency for mulitple modules: %v", err)
-		}
-	}
-
-	if nms.Config.Modprobe.FirmwarePath != "" {
-		args = append(args, "--"+worker.FlagFirmwareMountPath, worker.FirmwareMountPath)
-		if err = setFirmwareVolume(pod, p.workerCfg.SetFirmwareClassPath); err != nil {
-			return nil, fmt.Errorf("could not map host volume needed for firmware loading: %v", err)
-		}
 	}
 
 	if err = setWorkerContainerArgs(pod, args); err != nil {
@@ -835,7 +906,7 @@ func (p *podManagerImpl) LoaderPodTemplate(ctx context.Context, nmc client.Objec
 }
 
 func (p *podManagerImpl) UnloaderPodTemplate(ctx context.Context, nmc client.Object, nms *kmmv1beta1.NodeModuleStatus) (*v1.Pod, error) {
-	pod, err := p.baseWorkerPod(ctx, nmc.GetName(), &nms.ModuleItem, nmc)
+	pod, err := p.baseWorkerPod(ctx, nmc, &nms.ModuleItem, &nms.Config)
 	if err != nil {
 		return nil, fmt.Errorf("could not create the base Pod: %v", err)
 	}
@@ -857,9 +928,20 @@ func (p *podManagerImpl) UnloaderPodTemplate(ctx context.Context, nmc client.Obj
 	}
 
 	if nms.Config.Modprobe.FirmwarePath != "" {
-		args = append(args, "--"+worker.FlagFirmwareMountPath, worker.FirmwareMountPath)
-		if err = setFirmwareVolume(pod, p.workerCfg.SetFirmwareClassPath); err != nil {
-			return nil, fmt.Errorf("could not map host volume needed for firmware loading: %v", err)
+		firmwareHostPath := p.workerCfg.FirmwareHostPath
+		if firmwareHostPath == nil {
+			return nil, fmt.Errorf("firmwareHostPath was not set while the Module requires firmware unloading")
+		}
+		args = append(args, "--"+worker.FlagFirmwarePath, *firmwareHostPath)
+
+		firmwarePathContainerImg := filepath.Join(nms.Config.Modprobe.FirmwarePath, "*")
+		firmwarePathWorkerImg := filepath.Join(sharedFilesDir, nms.Config.Modprobe.FirmwarePath)
+		if err = addCopyCommand(pod, firmwarePathContainerImg, firmwarePathWorkerImg); err != nil {
+			return nil, fmt.Errorf("could not add the copy command to the init container: %v", err)
+		}
+
+		if err = setFirmwareVolume(pod, firmwareHostPath); err != nil {
+			return nil, fmt.Errorf("could not map host volume needed for firmware unloading: %v", err)
 		}
 	}
 
@@ -883,12 +965,26 @@ var (
 	}
 )
 
-func (p *podManagerImpl) baseWorkerPod(
-	ctx context.Context,
-	nodeName string,
-	item *kmmv1beta1.ModuleItem,
-	owner client.Object,
-) (*v1.Pod, error) {
+func addCopyCommand(pod *v1.Pod, src, dst string) error {
+
+	container, _ := podcmd.FindContainerByName(pod, initContainerName)
+	if container == nil {
+		return errors.New("could not find the init container")
+	}
+
+	const template = `
+mkdir -p %s;
+cp -R %s %s;
+`
+	copyCommand := fmt.Sprintf(template, dst, src, dst)
+	container.Args[0] = strings.Join([]string{container.Args[0], copyCommand}, "")
+
+	return nil
+}
+
+func (p *podManagerImpl) baseWorkerPod(ctx context.Context, nmc client.Object, item *kmmv1beta1.ModuleItem,
+	moduleConfig *kmmv1beta1.ModuleConfig) (*v1.Pod, error) {
+
 	const (
 		trustedCAVolumeName   = "trusted-ca"
 		volNameEtcContainers  = "etc-containers"
@@ -998,6 +1094,12 @@ func (p *podManagerImpl) baseWorkerPod(
 				},
 			},
 		},
+		{
+			Name: volNameTmp,
+			VolumeSource: v1.VolumeSource{
+				EmptyDir: &v1.EmptyDirVolumeSource{},
+			},
+		},
 	}
 
 	volumeMounts := []v1.VolumeMount{
@@ -1032,8 +1134,14 @@ func (p *podManagerImpl) baseWorkerPod(
 			ReadOnly:  true,
 			MountPath: filepath.Join(worker.PullSecretsDir, "_global", v1.DockerConfigJsonKey),
 		},
+		{
+			Name:      volNameTmp,
+			MountPath: sharedFilesDir,
+			ReadOnly:  true,
+		},
 	}
 
+	nodeName := nmc.GetName()
 	pod := v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: item.Namespace,
@@ -1046,6 +1154,25 @@ func (p *podManagerImpl) baseWorkerPod(
 			},
 		},
 		Spec: v1.PodSpec{
+			InitContainers: []v1.Container{
+				{
+					Name:            initContainerName,
+					Image:           moduleConfig.ContainerImage,
+					ImagePullPolicy: moduleConfig.ImagePullPolicy,
+					Command:         []string{"/bin/sh", "-c"},
+					Args:            []string{""},
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:      volNameTmp,
+							MountPath: sharedFilesDir,
+						},
+					},
+					Resources: v1.ResourceRequirements{
+						Requests: requests,
+						Limits:   limits,
+					},
+				},
+			},
 			Containers: []v1.Container{
 				{
 					Name:         workerContainerName,
@@ -1064,8 +1191,14 @@ func (p *podManagerImpl) baseWorkerPod(
 		},
 	}
 
-	if err = ctrl.SetControllerReference(owner, &pod, p.scheme); err != nil {
+	if err = ctrl.SetControllerReference(nmc, &pod, p.scheme); err != nil {
 		return nil, fmt.Errorf("could not set the owner as controller: %v", err)
+	}
+
+	kmodsPathContainerImg := filepath.Join(moduleConfig.Modprobe.DirName, "lib", "modules", moduleConfig.KernelVersion)
+	kmodsPathWorkerImg := filepath.Join(sharedFilesDir, moduleConfig.Modprobe.DirName, "lib", "modules")
+	if err = addCopyCommand(&pod, kmodsPathContainerImg, kmodsPathWorkerImg); err != nil {
+		return nil, fmt.Errorf("could not add the copy command to the init container: %v", err)
 	}
 
 	controllerutil.AddFinalizer(&pod, nodeModulesConfigFinalizer)
@@ -1148,21 +1281,20 @@ func setWorkerSofdepConfig(pod *v1.Pod, modulesLoadingOrder []string) error {
 	return nil
 }
 
-func setFirmwareVolume(pod *v1.Pod, hostFirmwarePath *string) error {
+func setFirmwareVolume(pod *v1.Pod, firmwareHostPath *string) error {
 	const volNameVarLibFirmware = "var-lib-firmware"
 	container, _ := podcmd.FindContainerByName(pod, workerContainerName)
 	if container == nil {
 		return errors.New("could not find the worker container")
 	}
 
-	firmwareVolumeMount := v1.VolumeMount{
-		Name:      volNameVarLibFirmware,
-		MountPath: worker.FirmwareMountPath,
+	if firmwareHostPath == nil {
+		return errors.New("hostFirmwarePath must be set")
 	}
 
-	hostMountPath := "/var/lib/firmware"
-	if hostFirmwarePath != nil {
-		hostMountPath = *hostFirmwarePath
+	firmwareVolumeMount := v1.VolumeMount{
+		Name:      volNameVarLibFirmware,
+		MountPath: *firmwareHostPath,
 	}
 
 	hostPathDirectoryOrCreate := v1.HostPathDirectoryOrCreate
@@ -1170,7 +1302,7 @@ func setFirmwareVolume(pod *v1.Pod, hostFirmwarePath *string) error {
 		Name: volNameVarLibFirmware,
 		VolumeSource: v1.VolumeSource{
 			HostPath: &v1.HostPathVolumeSource{
-				Path: hostMountPath,
+				Path: *firmwareHostPath,
 				Type: &hostPathDirectoryOrCreate,
 			},
 		},
@@ -1178,6 +1310,7 @@ func setFirmwareVolume(pod *v1.Pod, hostFirmwarePath *string) error {
 
 	pod.Spec.Volumes = append(pod.Spec.Volumes, firmwareVolume)
 	container.VolumeMounts = append(container.VolumeMounts, firmwareVolumeMount)
+
 	return nil
 }
 

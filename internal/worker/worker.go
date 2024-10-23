@@ -22,26 +22,22 @@ type Worker interface {
 }
 
 type worker struct {
-	im     ImageMounter
 	logger logr.Logger
 	mr     ModprobeRunner
+	fh     utils.FSHelper
 }
 
-func NewWorker(im ImageMounter, mr ModprobeRunner, logger logr.Logger) Worker {
+func NewWorker(mr ModprobeRunner, fh utils.FSHelper, logger logr.Logger) Worker {
 	return &worker{
-		im:     im,
 		logger: logger,
 		mr:     mr,
+		fh:     fh,
 	}
 }
 
-func (w *worker) LoadKmod(ctx context.Context, cfg *kmmv1beta1.ModuleConfig, firmwareMountPath string) error {
-	imageName := cfg.ContainerImage
+const sharedFilesDir = "/tmp"
 
-	fsDir, err := w.im.MountImage(ctx, imageName, cfg)
-	if err != nil {
-		return fmt.Errorf("failed to mount image %s: %v", imageName, err)
-	}
+func (w *worker) LoadKmod(ctx context.Context, cfg *kmmv1beta1.ModuleConfig, firmwareMountPath string) error {
 
 	inTreeModulesToRemove := cfg.InTreeModulesToRemove
 	// [TODO] - remove handling cfg.InTreeModuleToRemove once we cease to support it
@@ -51,16 +47,32 @@ func (w *worker) LoadKmod(ctx context.Context, cfg *kmmv1beta1.ModuleConfig, fir
 
 	if inTreeModulesToRemove != nil {
 		w.logger.Info("Unloading in-tree modules", "names", inTreeModulesToRemove)
+		modulesToUnload := make([]string, 0, len(inTreeModulesToRemove))
+		for _, module := range inTreeModulesToRemove {
+			exists, err := w.fh.FileExists("/lib/modules", fmt.Sprintf("^%s.ko", module))
+			if err != nil {
+				w.logger.Info(utils.WarnString(fmt.Sprintf("failed to check if module file %s present on the host:", module)), "error", err)
+				continue
+			}
+			if !exists {
+				w.logger.Info("not trying to unload in-tree module, since its file is not present on the host", "module", module)
+				continue
+			}
+			w.logger.Info("adding module to the list of intree modules to be unloadded", "module", module)
+			modulesToUnload = append(modulesToUnload, module)
+		}
 
-		runArgs := append([]string{"-rv"}, inTreeModulesToRemove...)
-		if err = w.mr.Run(ctx, runArgs...); err != nil {
-			return fmt.Errorf("could not remove in-tree modules %s: %v", strings.Join(inTreeModulesToRemove, ""), err)
+		if len(modulesToUnload) > 0 {
+			runArgs := append([]string{"-rv"}, modulesToUnload...)
+			if err := w.mr.Run(ctx, runArgs...); err != nil {
+				return fmt.Errorf("could not remove in-tree modules %s: %v", strings.Join(modulesToUnload, ""), err)
+			}
 		}
 	}
 
 	// prepare firmware
 	if cfg.Modprobe.FirmwarePath != "" {
-		imageFirmwarePath := filepath.Join(fsDir, cfg.Modprobe.FirmwarePath)
+		imageFirmwarePath := filepath.Join(sharedFilesDir, cfg.Modprobe.FirmwarePath)
 		w.logger.Info("preparing firmware for loading", "image directory", imageFirmwarePath, "host mount directory", firmwareMountPath)
 		options := cp.Options{
 			OnError: func(src, dest string, err error) error {
@@ -70,7 +82,7 @@ func (w *worker) LoadKmod(ctx context.Context, cfg *kmmv1beta1.ModuleConfig, fir
 				return nil
 			},
 		}
-		if err = cp.Copy(imageFirmwarePath, firmwareMountPath, options); err != nil {
+		if err := cp.Copy(imageFirmwarePath, firmwareMountPath, options); err != nil {
 			return fmt.Errorf("failed to copy firmware from path %s to path %s: %v", imageFirmwarePath, firmwareMountPath, err)
 		}
 	}
@@ -82,7 +94,7 @@ func (w *worker) LoadKmod(ctx context.Context, cfg *kmmv1beta1.ModuleConfig, fir
 	if cfg.Modprobe.RawArgs != nil {
 		args = cfg.Modprobe.RawArgs.Load
 	} else {
-		args = []string{"-vd", filepath.Join(fsDir, cfg.Modprobe.DirName)}
+		args = []string{"-vd", filepath.Join(sharedFilesDir, cfg.Modprobe.DirName)}
 
 		if cfg.Modprobe.Args != nil {
 			args = append(args, cfg.Modprobe.Args.Load...)
@@ -120,12 +132,6 @@ func (w *worker) SetFirmwareClassPath(value string) error {
 }
 
 func (w *worker) UnloadKmod(ctx context.Context, cfg *kmmv1beta1.ModuleConfig, firmwareMountPath string) error {
-	imageName := cfg.ContainerImage
-
-	fsDir, err := w.im.MountImage(ctx, imageName, cfg)
-	if err != nil {
-		return fmt.Errorf("failed to mount image %s: %v", imageName, err)
-	}
 
 	moduleName := cfg.Modprobe.ModuleName
 
@@ -134,7 +140,7 @@ func (w *worker) UnloadKmod(ctx context.Context, cfg *kmmv1beta1.ModuleConfig, f
 	if cfg.Modprobe.RawArgs != nil {
 		args = cfg.Modprobe.RawArgs.Unload
 	} else {
-		args = []string{"-rvd", filepath.Join(fsDir, cfg.Modprobe.DirName)}
+		args = []string{"-rvd", filepath.Join(sharedFilesDir, cfg.Modprobe.DirName)}
 
 		if cfg.Modprobe.Args != nil {
 			args = append(args, cfg.Modprobe.Args.Unload...)
@@ -145,32 +151,14 @@ func (w *worker) UnloadKmod(ctx context.Context, cfg *kmmv1beta1.ModuleConfig, f
 
 	w.logger.Info("Unloading module", "name", moduleName)
 
-	if err = w.mr.Run(ctx, args...); err != nil {
+	if err := w.mr.Run(ctx, args...); err != nil {
 		return fmt.Errorf("could not unload module %s: %v", moduleName, err)
 	}
 
 	//remove firmware files only (no directories)
 	if cfg.Modprobe.FirmwarePath != "" {
-		imageFirmwarePath := filepath.Join(fsDir, cfg.Modprobe.FirmwarePath)
-		err = filepath.Walk(imageFirmwarePath, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if !info.IsDir() {
-				relPath, err := filepath.Rel(imageFirmwarePath, path)
-				if err != nil {
-					w.logger.Info(utils.WarnString("failed to get relative path"), "imageFirmwarePath", imageFirmwarePath, "path", path, "error", err)
-					return nil
-				}
-				fileToRemove := filepath.Join(firmwareMountPath, relPath)
-				w.logger.Info("Removing firmware file", "file", fileToRemove)
-				err = os.Remove(fileToRemove)
-				if err != nil {
-					w.logger.Info(utils.WarnString("failed to delete file"), "file", fileToRemove, "error", err)
-				}
-			}
-			return nil
-		})
+		imageFirmwarePath := filepath.Join(sharedFilesDir, cfg.Modprobe.FirmwarePath)
+		err := w.fh.RemoveSrcFilesFromDst(imageFirmwarePath, firmwareMountPath)
 		if err != nil {
 			w.logger.Info(utils.WarnString("failed to remove all firmware blobs"), "error", err)
 		}
